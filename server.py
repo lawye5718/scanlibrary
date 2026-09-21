@@ -18,8 +18,10 @@ ScanLibrary —— 本地扫描书 → 可重排 EPUB 工作台
 
 import argparse
 import base64
+import difflib
 import html
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -61,6 +63,7 @@ AUTH_FILE: Path = None      # 登录密码文件（明文，本地单用户）
 STATS_FILE: Path = None     # 历史每页耗时统计（用于全书时长估算）
 PASSWORD = [None]           # 当前密码（--password 或 auth.json）
 OCR_FAIL_TAG = "【OCR-FAILED】"  # 失败页缓存标记：重跑时识别并重新 OCR
+NO_TEXT_TOKEN = "〔无文字〕"
 TOKENS: dict = {}           # token -> 过期时间戳
 LAST_ACTIVITY = [time.time()]  # 最后一次已认证请求时间
 IDLE_MINUTES = 30           # 空闲超过该分钟数且无任务时：清登录态+卸载模型
@@ -355,6 +358,174 @@ def extract_text_layer(pdf_path: Path):
         return texts
     except Exception:
         return None
+
+
+def text_char_count(text: str) -> int:
+    return len(re.findall(rf"[A-Za-z0-9{CJK}]", text or ""))
+
+
+def image_marker_md(img_path: Path, label: str = "插图") -> str:
+    return f"![{label}](images/{img_path.name})"
+
+
+def likely_full_page_illustration(img_path: Path) -> bool:
+    """粗略判定整页大图：低留白 + 绝大多数行都被图像覆盖。"""
+    try:
+        fitz = _pymupdf()
+        doc = fitz.open(str(img_path))
+        page = doc[0]
+        rect = page.rect
+        scale = min(1.0, 96.0 / max(rect.width, rect.height))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        doc.close()
+        w, h, n = pix.width, pix.height, pix.n
+        if w <= 0 or h <= 0 or n <= 0:
+            return False
+        white = dark = 0
+        active_rows = 0
+        samples = pix.samples
+        row_thresh = max(3, int(w * 0.12))
+        for y in range(h):
+            row_dark = 0
+            base = y * w * n
+            for x in range(w):
+                idx = base + x * n
+                if n >= 3:
+                    lum = (samples[idx] * 299 + samples[idx + 1] * 587 + samples[idx + 2] * 114) // 1000
+                else:
+                    lum = samples[idx]
+                if lum >= 245:
+                    white += 1
+                if lum <= 110:
+                    dark += 1
+                    row_dark += 1
+            if row_dark >= row_thresh:
+                active_rows += 1
+        total = w * h
+        white_ratio = white / max(1, total)
+        dark_ratio = dark / max(1, total)
+        active_ratio = active_rows / max(1, h)
+        return white_ratio <= 0.76 and dark_ratio >= 0.08 and active_ratio >= 0.72
+    except Exception:
+        return False
+
+
+def split_image_halves(img_path: Path) -> list[Path]:
+    """把顽固页面裁成上下两半，降低视觉上下文复杂度。"""
+    fitz = _pymupdf()
+    doc = fitz.open(str(img_path))
+    page = doc[0]
+    rect = page.rect
+    mid = rect.y0 + rect.height / 2
+    clips = [
+        ("top", fitz.Rect(rect.x0, rect.y0, rect.x1, mid)),
+        ("bottom", fitz.Rect(rect.x0, mid, rect.x1, rect.y1)),
+    ]
+    parts = []
+    for suffix, clip in clips:
+        out = img_path.with_suffix(f".{suffix}.jpg")
+        pix = page.get_pixmap(clip=clip, alpha=False)
+        pix.save(str(out), jpg_quality=85)
+        parts.append(out)
+    doc.close()
+    return parts
+
+
+def is_suspicious_ocr_text(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or s == NO_TEXT_TOKEN:
+        return True
+    chars = text_char_count(s)
+    if re.fullmatch(r"[\s.。·•…—\-_=~]+", s):
+        return True
+    if re.search(r"[.。·•…]{6,}", s) and chars < max(80, len(s) // 2):
+        return True
+    if re.search(r"(.)\1{15,}", s) and chars < 60:
+        return True
+    return False
+
+
+def strip_noise_lines(text: str) -> str:
+    kept = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            kept.append("")
+            continue
+        if re.fullmatch(r"[0-9ivxlcdmIVXLCDM]{1,8}", line):
+            continue
+        if re.fullmatch(r"[·•\-.。…_=\s]{4,}", line):
+            continue
+        kept.append(raw)
+    return "\n".join(kept).strip()
+
+
+NOTE_REF_RE = re.compile(r"\[\[NOTE_REF:(\d+)\|(.+?)\]\]")
+NOTE_MARKER_RE = re.compile(
+    r"^\s*(\[[0-9]{1,3}\]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|"
+    r"\([0-9]{1,3}\)|（[0-9]{1,3}）|[0-9]{1,3}[、.)]|注[：:])\s*"
+)
+
+
+def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    body, notes = [], []
+    half = max(1, len(paras) // 2)
+    for idx, para in enumerate(paras):
+        m = NOTE_MARKER_RE.match(para)
+        if m and idx >= half and len(para) <= 600:
+            label = m.group(1).strip()
+            note_text = para[m.end():].strip() or para.strip()
+            note = {"id": next_note_id, "label": label, "text": note_text, "page": page_no}
+            notes.append(note)
+            next_note_id += 1
+        else:
+            body.append(para)
+    body_text = "\n\n".join(body).strip()
+    for note in notes:
+        body_text, n = re.subn(
+            re.escape(note["label"]),
+            f"[[NOTE_REF:{note['id']}|{note['label']}]]",
+            body_text,
+            count=1,
+        )
+        note["linked"] = bool(n)
+    return body_text, notes, next_note_id
+
+
+def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    out = []
+    for para in paras:
+        if out:
+            prev = out[-1]
+            score = difflib.SequenceMatcher(None, prev, para).ratio()
+            shorter = min(len(prev), len(para))
+            if (shorter >= 20 and score >= similarity) or (shorter >= 40 and (prev in para or para in prev)):
+                continue
+        out.append(re.sub(r"(.{12,200}?)(?:\s*\1){1,}", r"\1", para))
+    return "\n\n".join(out)
+
+
+def render_note_refs_as_text(text: str) -> str:
+    return NOTE_REF_RE.sub(lambda m: m.group(2), text or "")
+
+
+def note_refs_for_epub(text: str, notes: list[dict]) -> tuple[str, list[dict]]:
+    by_id = {n["id"]: n for n in notes}
+    chapter_notes = []
+    seen = set()
+
+    def repl(m):
+        nid = int(m.group(1))
+        label = m.group(2)
+        note = by_id.get(nid)
+        if note and nid not in seen:
+            chapter_notes.append(note)
+            seen.add(nid)
+        return f"[[NOTE_REF:{nid}|{label}]]"
+
+    return NOTE_REF_RE.sub(repl, text or ""), chapter_notes
 
 
 # ---------------------------------------------------------------------------
