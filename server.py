@@ -412,6 +412,80 @@ def extract_text_layer(pdf_path: Path):
         return None
 
 
+def extract_pdf_outline_chapters(pdf_path: Path, page_range=None):
+    """提取 PDF 书签目录并转成章范围 [{title,start_page,end_page}]（1-based）。"""
+    try:
+        fitz = _pymupdf()
+        doc = fitz.open(str(pdf_path))
+        total = doc.page_count
+        toc = doc.get_toc(simple=True) or []
+        doc.close()
+    except Exception:
+        return []
+    if not toc:
+        return []
+
+    levels = []
+    for row in toc:
+        try:
+            lv, _, page = row[:3]
+            lv = int(lv)
+            page = int(page)
+            if lv >= 1 and page >= 1:
+                levels.append(lv)
+        except Exception:
+            continue
+    if not levels:
+        return []
+    chapter_level = 1 if 1 in levels else min(levels)
+
+    starts = []
+    seen = set()
+    for row in toc:
+        try:
+            lv, raw_title, page = row[:3]
+            lv = int(lv)
+            page = int(page)
+        except Exception:
+            continue
+        if lv != chapter_level or page < 1 or page > total:
+            continue
+        title = re.sub(r"\s+", " ", str(raw_title or "")).strip()
+        if not title:
+            continue
+        key = (title, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        starts.append((title, page))
+    if not starts:
+        return []
+
+    starts.sort(key=lambda x: x[1])
+    r0, r1 = 1, total
+    if page_range and len(page_range) == 2:
+        try:
+            r0 = max(1, int(page_range[0]))
+            r1 = min(total, int(page_range[1]))
+        except Exception:
+            r0, r1 = 1, total
+    if r0 > r1:
+        return []
+
+    chapters = []
+    for i, (title, start_page) in enumerate(starts):
+        next_start = starts[i + 1][1] if i + 1 < len(starts) else (total + 1)
+        end_page = min(total, next_start - 1)
+        if end_page < r0 or start_page > r1:
+            continue
+        chapters.append({
+            "title": title,
+            "start_page": max(r0, start_page),
+            "end_page": min(r1, end_page),
+        })
+    return chapters
+
+
 def text_char_count(text: str) -> int:
     return len(re.findall(rf"[A-Za-z0-9{CJK}]", text or ""))
 
@@ -611,6 +685,12 @@ def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
         norm = re.sub(rf"[^\w{CJK}]+", "", para)
         if norm and any(prev_norm == norm for prev_norm in recent_norms[-8:]):
             continue
+        if norm and any(
+            prev_norm.startswith(norm) and len(norm) >= 12 and len(prev_norm) >= 24
+            and (len(norm) / max(1, len(prev_norm)) <= 0.6)
+            for prev_norm in recent_norms[-8:]
+        ):
+            continue
         if len(norm) >= 80:
             dup_recent = False
             for prev_norm in recent_norms[-8:]:
@@ -689,6 +769,55 @@ def join_processed_pages(processed: list[dict]) -> str:
         out.append(sep + text)
         prev = item
     return "".join(out).strip()
+
+
+def split_chapters_by_pdf_toc(processed: list[dict], toc_chapters: list[dict]) -> list[tuple[str, str]]:
+    """按 PDF 目录页码把已处理页面拼成章节。"""
+    if not processed or not toc_chapters:
+        return []
+    pages = sorted(p for p in processed if (p.get("text") or "").strip())
+    if not pages:
+        return []
+    first_page = pages[0]["page"]
+    last_page = pages[-1]["page"]
+
+    chapter_specs = []
+    last_end = first_page - 1
+    for item in sorted(toc_chapters, key=lambda x: x.get("start_page", 0)):
+        title = (item.get("title") or "").strip() or "正文"
+        start = max(first_page, int(item.get("start_page", first_page)))
+        end = min(last_page, int(item.get("end_page", last_page)))
+        if end < start:
+            continue
+        if start <= last_end:
+            start = last_end + 1
+        if start > end:
+            continue
+        chapter_specs.append((title, start, end))
+        last_end = end
+
+    if not chapter_specs:
+        return []
+
+    out = []
+    cursor = first_page
+    for title, start, end in chapter_specs:
+        if cursor < start:
+            pref_items = [p for p in pages if cursor <= p["page"] < start]
+            pref_body = join_processed_pages(pref_items)
+            if pref_body:
+                out.append(("前言" if not out else "正文", pref_body))
+        body_items = [p for p in pages if start <= p["page"] <= end]
+        body = join_processed_pages(body_items)
+        if body:
+            out.append((title, body))
+        cursor = end + 1
+    if cursor <= last_page:
+        tail_items = [p for p in pages if cursor <= p["page"] <= last_page]
+        tail = join_processed_pages(tail_items)
+        if tail:
+            out.append(("正文", tail))
+    return out
 
 
 def dedupe_layout_parts(parts: list[tuple[int, int, str]], similarity=0.985):
@@ -1181,6 +1310,7 @@ PAGE_BROKEN_LINE_RE = re.compile(r"[·、，：；/\\—–－]\s*$")
 # 段内复读机：同一片段 8~400 字重复 2 次以上；同一短词重复 4 次以上
 PAGE_INLINE_DUP_RE = re.compile(r"(.{4,200}?)(?:\s*\1){2,}", re.DOTALL)
 PAGE_TOKEN_DUP_RE = re.compile(r"\b([A-Za-z\u4e00-\u9fff]{2,})\b(?:\s*\1\b){3,}")
+PAGE_FIGURE_INDEX_LINE_RE = re.compile(r"^图\s*([0-9]{1,4})$")
 PAGE_SHORT_LINE_MAX = 30
 
 CIRCLED_NUMS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
@@ -1226,8 +1356,24 @@ def clean_page_text(text):
     text = PAGE_TOKEN_DUP_RE.sub(lambda m: m.group(1), text)
     text = PAGE_INLINE_DUP_RE.sub(lambda m: m.group(1), text)
     text = _collapse_full_repeat(text)
+    lines = text.split("\n")
+    fig_nums = []
+    non_empty = 0
+    for line in lines:
+        s = line.strip()
+        if not s:
+            continue
+        non_empty += 1
+        m = PAGE_FIGURE_INDEX_LINE_RE.fullmatch(s)
+        if m:
+            fig_nums.append(int(m.group(1)))
+    if len(fig_nums) >= 8 and non_empty > 0 and len(fig_nums) / non_empty >= 0.5:
+        mono = sum(1 for a, b in zip(fig_nums, fig_nums[1:]) if b >= a)
+        if fig_nums[0] <= 5 and max(fig_nums) >= 12 and mono >= max(1, len(fig_nums) - 2):
+            lines = [ln for ln in lines if not PAGE_FIGURE_INDEX_LINE_RE.fullmatch(ln.strip())]
+
     kept = []
-    for line in text.split("\n"):
+    for line in lines:
         s = line.strip()
         if s and len(s) <= PAGE_SHORT_LINE_MAX and PAGE_BROKEN_LINE_RE.search(s):
             continue
@@ -1316,7 +1462,11 @@ CHAPTER_PATTERNS = [
 
 def is_chapter_line(line):
     s = line.strip()
-    if not s or len(s) > 60:
+    if not s:
+        return False
+    if re.match(r"^#+\s+\S", s):
+        return True
+    if len(s) > 60:
         return False
     return any(re.match(p, s) for p in CHAPTER_PATTERNS)
 
@@ -1936,14 +2086,14 @@ def notes_block(notes):
 
 
 def build_epub_from_source(full, notes, book_dir, slug, title, author, cfg,
-                           images_dir=None):
+                           images_dir=None, prebuilt_chapters=None):
     """把正文（可含 [[NOTE_REF]] 标记）切章并打包 EPUB。
 
     转换流程与「单独校对」都走这里，保证两条路径产物结构完全一致。
     返回 (epub_path, chapters)。
     """
     notes = notes or []
-    raw_chapters = split_chapters(full)
+    raw_chapters = prebuilt_chapters or split_chapters(full)
     chapters = []
     implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
     if implicit_single:
@@ -2078,6 +2228,9 @@ def run_job(job_id):
         page_texts = {}
         all_notes = []
         next_note_id = 1
+        pdf_toc_chapters = extract_pdf_outline_chapters(pdf_path, cfg.get("page_range"))
+        if pdf_toc_chapters:
+            log(job_id, f"识别到 PDF 目录章节 {len(pdf_toc_chapters)} 条，将按目录切章")
 
         # ---- 1. 有文字层且用户选择跳过 OCR ----
         if backend == "text-layer":
@@ -2214,7 +2367,15 @@ def run_job(job_id):
                 recent_page_norms.append(normalized_text_for_dedup(body_text))
             if notes:
                 all_notes.extend(notes)
-        full = join_processed_pages(processed)
+        toc_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters) if pdf_toc_chapters else []
+        if toc_chapters:
+            full = "\n\n".join(
+                f"# {title.strip() or '正文'}\n\n{body}".strip()
+                for title, body in toc_chapters
+                if (body or "").strip()
+            ).strip()
+        else:
+            full = join_processed_pages(processed)
         full = collapse_repeated_paragraphs(merge_wrapped_lines(full))
         notes_md = notes_block(all_notes)
         book_md = render_note_refs_as_text(full)
