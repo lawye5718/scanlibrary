@@ -18,8 +18,10 @@ ScanLibrary —— 本地扫描书 → 可重排 EPUB 工作台
 
 import argparse
 import base64
+import difflib
 import html
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -61,6 +63,7 @@ AUTH_FILE: Path = None      # 登录密码文件（明文，本地单用户）
 STATS_FILE: Path = None     # 历史每页耗时统计（用于全书时长估算）
 PASSWORD = [None]           # 当前密码（--password 或 auth.json）
 OCR_FAIL_TAG = "【OCR-FAILED】"  # 失败页缓存标记：重跑时识别并重新 OCR
+NO_TEXT_TOKEN = "〔无文字〕"
 TOKENS: dict = {}           # token -> 过期时间戳
 LAST_ACTIVITY = [time.time()]  # 最后一次已认证请求时间
 IDLE_MINUTES = 30           # 空闲超过该分钟数且无任务时：清登录态+卸载模型
@@ -357,6 +360,179 @@ def extract_text_layer(pdf_path: Path):
         return None
 
 
+def text_char_count(text: str) -> int:
+    return len(re.findall(rf"[A-Za-z0-9{CJK}]", text or ""))
+
+
+def image_marker_md(img_path: Path, label: str = "插图") -> str:
+    return f"![{label}](images/{img_path.name})"
+
+
+def safe_epub_asset_name(name: str) -> str:
+    base = Path(name).name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip(".-")
+    return safe or "asset.bin"
+
+
+def likely_full_page_illustration(img_path: Path) -> bool:
+    """粗略判定整页大图：低留白 + 绝大多数行都被图像覆盖。"""
+    try:
+        fitz = _pymupdf()
+        doc = fitz.open(str(img_path))
+        page = doc[0]
+        rect = page.rect
+        scale = min(1.0, 96.0 / max(rect.width, rect.height))
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        doc.close()
+        w, h, n = pix.width, pix.height, pix.n
+        if w <= 0 or h <= 0 or n <= 0:
+            return False
+        white = dark = 0
+        active_rows = 0
+        samples = pix.samples
+        row_thresh = max(3, int(w * 0.12))
+        for y in range(h):
+            row_dark = 0
+            base = y * w * n
+            for x in range(w):
+                idx = base + x * n
+                if n >= 3:
+                    lum = (samples[idx] * 299 + samples[idx + 1] * 587 + samples[idx + 2] * 114) // 1000
+                else:
+                    lum = samples[idx]
+                if lum >= 245:
+                    white += 1
+                if lum <= 110:
+                    dark += 1
+                    row_dark += 1
+            if row_dark >= row_thresh:
+                active_rows += 1
+        total = w * h
+        white_ratio = white / max(1, total)
+        dark_ratio = dark / max(1, total)
+        active_ratio = active_rows / max(1, h)
+        return white_ratio <= 0.76 and dark_ratio >= 0.08 and active_ratio >= 0.72
+    except Exception:
+        return False
+
+
+def split_image_halves(img_path: Path) -> list[Path]:
+    """把顽固页面裁成上下两半，降低视觉上下文复杂度。"""
+    fitz = _pymupdf()
+    doc = fitz.open(str(img_path))
+    try:
+        page = doc[0]
+        rect = page.rect
+        mid = rect.y0 + rect.height / 2
+        clips = [
+            ("top", fitz.Rect(rect.x0, rect.y0, rect.x1, mid)),
+            ("bottom", fitz.Rect(rect.x0, mid, rect.x1, rect.y1)),
+        ]
+        parts = []
+        for suffix, clip in clips:
+            out = img_path.with_suffix(f".{suffix}.jpg")
+            pix = page.get_pixmap(clip=clip, alpha=False)
+            pix.save(str(out), jpg_quality=85)
+            parts.append(out)
+        return parts
+    finally:
+        doc.close()
+
+
+def is_suspicious_ocr_text(text: str) -> bool:
+    s = (text or "").strip()
+    if not s or s == NO_TEXT_TOKEN:
+        return True
+    chars = text_char_count(s)
+    if re.fullmatch(r"[\s.。·•…—\-_=~]+", s):
+        return True
+    if re.search(r"[.。·•…]{6,}", s) and chars < max(80, len(s) // 2):
+        return True
+    if re.search(r"(.)\1{15,}", s) and chars < 60:
+        return True
+    return False
+
+
+def strip_noise_lines(text: str) -> str:
+    kept = []
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
+            kept.append("")
+            continue
+        if re.fullmatch(r"[0-9ivxlcdmIVXLCDM]{1,8}", line):
+            continue
+        if re.fullmatch(r"[·•\-.。…_=\s]{4,}", line):
+            continue
+        kept.append(raw)
+    return "\n".join(kept).strip()
+
+
+NOTE_REF_RE = re.compile(r"\[\[NOTE_REF:(\d+)\|(.+?)\]\]")
+NOTE_MARKER_RE = re.compile(
+    r"^\s*(\[[0-9]{1,3}\]|[①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳]|"
+    r"\([0-9]{1,3}\)|（[0-9]{1,3}）|[0-9]{1,3}[、.)]|注[：:])\s*"
+)
+
+
+def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    body, notes = [], []
+    half = max(1, len(paras) // 2)
+    for idx, para in enumerate(paras):
+        m = NOTE_MARKER_RE.match(para)
+        if m and idx >= half and len(para) <= 600:
+            label = m.group(1).strip()
+            note_text = para[m.end():].strip() or para.strip()
+            note = {"id": next_note_id, "label": label, "text": note_text, "page": page_no}
+            notes.append(note)
+            next_note_id += 1
+        else:
+            body.append(para)
+    body_text = "\n\n".join(body).strip()
+    for note in notes:
+        label_pat = rf"(?<![A-Za-z0-9]){re.escape(note['label'])}(?![A-Za-z0-9])"
+        body_text, n = re.subn(
+            label_pat,
+            f"[[NOTE_REF:{note['id']}|{note['label']}]]",
+            body_text,
+            count=1,
+        )
+        note["linked"] = bool(n)
+    return body_text, notes, next_note_id
+
+
+def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    out = []
+    for para in paras:
+        if out:
+            prev = out[-1]
+            score = difflib.SequenceMatcher(None, prev, para).ratio()
+            shorter = min(len(prev), len(para))
+            if (shorter >= 20 and score >= similarity) or (shorter >= 40 and (prev in para or para in prev)):
+                continue
+        out.append(re.sub(r"(.{12,200}?)(?:\s*\1){1,}", r"\1", para))
+    return "\n\n".join(out)
+
+
+def render_note_refs_as_text(text: str) -> str:
+    return NOTE_REF_RE.sub(lambda m: m.group(2), text or "")
+
+
+def collect_note_refs_for_epub(text: str, notes: list[dict]) -> list[dict]:
+    by_id = {n["id"]: n for n in notes}
+    chapter_notes = []
+    seen = set()
+    for m in NOTE_REF_RE.finditer(text or ""):
+        nid = int(m.group(1))
+        note = by_id.get(nid)
+        if note and nid not in seen:
+            chapter_notes.append(note)
+            seen.add(nid)
+    return chapter_notes
+
+
 # ---------------------------------------------------------------------------
 # OCR 后端
 # ---------------------------------------------------------------------------
@@ -437,7 +613,11 @@ def ocr_page_glmocr(cfg, img_path: Path, attempt: int = 1):
     prompt = "Text Recognition:"
     timeout = int(cfg.get("page_timeout", 300))
     if attempt >= 3:
-        prompt = "识别图片中的文字。如果图片中没有文字，直接输出：〔无文字〕"
+        prompt = (
+            "请逐字逐句完整提取图片中的所有文字。严禁总结，严禁省略，"
+            "严禁使用“...”或“略”等符号代替原文。"
+            f"如果图片中没有文字，直接输出：{NO_TEXT_TOKEN}"
+        )
         opts["num_predict"] = 1024
         timeout = min(timeout, 150)
     return ollama_generate(
@@ -452,6 +632,46 @@ def ocr_page_glmocr(cfg, img_path: Path, attempt: int = 1):
 def ocr_page_stub(cfg, img_path: Path, attempt: int = 1):
     """测试后端：不 OCR，生成占位文本（用于验证流水线是否跑通）。"""
     return f"（stub 模式）第 {img_path.stem} 页占位文本。\n\n这是用于验证流水线的示例段落。"
+
+
+def ocr_page_backend(cfg, img_path: Path) -> str:
+    backend = cfg.get("backend", "glm-ocr")
+    if backend == "stub":
+        return clean_page_text(ocr_page_stub(cfg, img_path, 1))
+    return clean_page_text(ocr_page_with_fallback(cfg, img_path))
+
+
+def ocr_page_with_fallback(cfg, img_path: Path) -> str:
+    """整页 OCR 策略：整页插图直出图片，其余页面分级重试 + 半页切分。"""
+    if likely_full_page_illustration(img_path):
+        return image_marker_md(img_path, "整页插图")
+
+    errors = []
+    for attempt in range(1, 4):
+        try:
+            txt = strip_noise_lines(clean_page_text(ocr_page_glmocr(cfg, img_path, attempt)))
+            if is_suspicious_ocr_text(txt):
+                raise RuntimeError("OCR 返回疑似无效文本")
+            return txt
+        except Exception as e:  # noqa
+            errors.append(str(e))
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+
+    parts = split_image_halves(img_path)
+    part_out = []
+    for part in parts:
+        try:
+            txt = strip_noise_lines(clean_page_text(ocr_page_glmocr(cfg, part, 3)))
+            if txt and txt != NO_TEXT_TOKEN and not is_suspicious_ocr_text(txt):
+                part_out.append(txt)
+        except Exception as e:  # noqa
+            errors.append(f"{part.name}: {e}")
+    if part_out:
+        merged = "\n".join(part_out).strip()
+        if merged and not is_suspicious_ocr_text(merged):
+            return merged
+    raise RuntimeError("；".join(errors[-4:]) or "OCR 失败")
 
 
 def run_mineru(cfg, pdf_path: Path, work_dir: Path):
@@ -609,6 +829,11 @@ def inline_md(s):
     s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
     s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", s)
     s = re.sub(r"`(.+?)`", r"<code>\1</code>", s)
+    s = re.sub(
+        r"\[\[NOTE_REF:(\d+)\|(.+?)\]\]",
+        r'<a id="note-ref-\1" epub:type="noteref" class="noteref" href="notes.xhtml#note-\1">\2</a>',
+        s,
+    )
     s = re.sub(r"!\[(.*?)\]\((.*?)\)", r'<img alt="\1" src="\2"/>', s)
     s = re.sub(r"\[(.+?)\]\((.+?)\)", r'<a href="\2">\1</a>', s)
     return s
@@ -692,16 +917,21 @@ p{text-indent:2em;margin:.5em 0;text-align:justify;}
 blockquote{margin:1em 2em;color:#555;}
 hr{border:none;border-top:1px solid #ccc;margin:2em 0;}
 code{font-family:ui-monospace,Menlo,monospace;font-size:.9em;}
-img{max-width:100%;}
+img{max-width:100%;display:block;margin:1em auto;}
+.illustration-page p{text-indent:0;text-align:center;}
+.noteref{text-decoration:none;vertical-align:super;font-size:.8em;}
+.notes p{text-indent:0;margin:.8em 0;}
+.notes a.backref{text-decoration:none;margin-left:.4em;}
 """
 
 
-def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN"):
-    """把 [(章节标题, markdown)] 打成 EPUB3。"""
+def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_dir: Path | None = None, notes=None):
+    """把章节、插图、注释打成 EPUB3。"""
     epub_path.parent.mkdir(parents=True, exist_ok=True)
     bookid = f"urn:uuid:{uuid.uuid4()}"
     modified = now_iso()
     nav_items, manifest, spine = [], [], []
+    notes = notes or []
 
     with zipfile.ZipFile(epub_path, "w", zipfile.ZIP_DEFLATED) as z:
         # mimetype 必须是第一个条目且不压缩
@@ -713,21 +943,57 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN"):
                    '</container>')
         z.writestr("OEBPS/style.css", CSS)
 
-        for i, (ctitle, body) in enumerate(chapters):
+        if assets_dir and assets_dir.exists():
+            for asset in sorted(assets_dir.iterdir()):
+                if not asset.is_file():
+                    continue
+                mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
+                safe_name = safe_epub_asset_name(asset.name)
+                href = html.escape(f"images/{safe_name}", quote=True)
+                z.writestr(f"OEBPS/images/{safe_name}", asset.read_bytes())
+                asset_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", safe_name)
+                manifest.append(f'    <item id="asset-{asset_id}" href="{href}" media-type="{mime}"/>')
+
+        for i, chapter in enumerate(chapters):
+            ctitle = chapter["title"]
+            body = chapter["body"]
             fname = f"chap_{i + 1:04d}.xhtml"
             xhtml = md_to_xhtml(body)
+            body_class = ' class="illustration-page"' if chapter.get("illustration_only") else ""
             doc = (
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<!DOCTYPE html>\n'
                 '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="%s">\n'
                 '<head><meta charset="utf-8"/><title>%s</title>'
                 '<link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
-                '<body>\n<h2>%s</h2>\n%s\n</body>\n</html>\n'
-            ) % (lang, html.escape(ctitle), html.escape(ctitle), xhtml)
+                '<body%s>\n<h2 id="chapter-%d">%s</h2>\n%s\n</body>\n</html>\n'
+            ) % (lang, html.escape(ctitle), body_class, i + 1, html.escape(ctitle), xhtml)
             z.writestr(f"OEBPS/{fname}", doc)
             manifest.append(f'    <item id="c{i + 1}" href="{fname}" media-type="application/xhtml+xml"/>')
             spine.append(f'    <itemref idref="c{i + 1}"/>')
             nav_items.append((ctitle, fname))
+
+        if notes:
+            note_lines = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                '<!DOCTYPE html>',
+                f'<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{lang}">',
+                '<head><meta charset="utf-8"/><title>注释</title><link rel="stylesheet" type="text/css" href="style.css"/></head>',
+                '<body class="notes"><h2>注释</h2>',
+            ]
+            for note in notes:
+                label = html.escape(note.get("label") or f"[{note['id']}]")
+                text = inline_md(note.get("text", ""))
+                chapter_href = html.escape(note.get("chapter_href", "nav.xhtml"))
+                note_lines.append(
+                    f'<p id="note-{note["id"]}"><strong>{label}</strong> {text}'
+                    f'<a class="backref" aria-label="返回正文中的注释引用" '
+                    f'href="{chapter_href}#note-ref-{note["id"]}">返回正文（{label}）</a></p>'
+                )
+            note_lines += ['</body>', '</html>', '']
+            z.writestr("OEBPS/notes.xhtml", "\n".join(note_lines))
+            manifest.append('    <item id="notes" href="notes.xhtml" media-type="application/xhtml+xml"/>')
+            nav_items.append(("注释", "notes.xhtml"))
 
         nav = ['<?xml version="1.0" encoding="UTF-8"?>',
                '<!DOCTYPE html>',
@@ -815,6 +1081,8 @@ def run_job(job_id):
 
         backend = cfg.get("backend", "glm-ocr")
         page_texts = {}
+        all_notes = []
+        next_note_id = 1
 
         # ---- 1. 有文字层且用户选择跳过 OCR ----
         if backend == "text-layer":
@@ -857,7 +1125,7 @@ def run_job(job_id):
             if cached:
                 log(job_id, f"复用已完成页面 {cached} 页")
 
-            ocr_fn = {"glm-ocr": ocr_page_glmocr, "stub": ocr_page_stub}.get(backend, ocr_page_glmocr)
+            ocr_fn = ocr_page_backend
             # Mac 上 Ollama 并发>1 会触发 llama-server 二次加载超时（HTTP 500），
             # 默认串行最稳；确有富余再手动调高
             concurrency = max(1, min(int(cfg.get("concurrency", 1)), 4))
@@ -869,22 +1137,17 @@ def run_job(job_id):
                 if CANCEL_FLAGS.get(job_id):
                     return
                 pno, p = item
-                for attempt in range(1, 4):
-                    try:
-                        txt = clean_page_text(ocr_fn(cfg, p, attempt))
-                        if not txt:
-                            raise RuntimeError("空结果")
-                        (pages_dir / f"{pno:04d}.md").write_text(txt, encoding="utf-8")
-                        with lock:
-                            page_texts[pno] = txt
-                        break
-                    except Exception as e:  # noqa
-                        if attempt == 3 or CANCEL_FLAGS.get(job_id):
-                            log(job_id, f"第 {pno} 页失败：{e}")
-                            (pages_dir / f"{pno:04d}.md").write_text(
-                                OCR_FAIL_TAG + f"\n{e}", encoding="utf-8")
-                        else:
-                            time.sleep(2 * attempt)
+                try:
+                    txt = ocr_fn(cfg, p)
+                    if not txt or is_suspicious_ocr_text(txt):
+                        raise RuntimeError("空结果")
+                    (pages_dir / f"{pno:04d}.md").write_text(txt, encoding="utf-8")
+                    with lock:
+                        page_texts[pno] = txt
+                except Exception as e:  # noqa
+                    log(job_id, f"第 {pno} 页失败：{e}")
+                    (pages_dir / f"{pno:04d}.md").write_text(
+                        OCR_FAIL_TAG + f"\n{e}", encoding="utf-8")
                 with lock:
                     done[0] += 1
                     n = done[0]
@@ -911,16 +1174,37 @@ def run_job(job_id):
                 raise RuntimeError("已取消")
 
         # ---- 3. 后处理 ----
-        log(job_id, "清理页眉页脚、合并断行")
-        ordered = [page_texts[k] for k in sorted(page_texts.keys())]
+        log(job_id, "清理页眉页脚、合并断行与注释")
+        ordered_keys = sorted(page_texts.keys())
+        ordered = [page_texts[k] for k in ordered_keys]
         if backend not in ("mineru",):
             junk = detect_running_titles(ordered)
             if junk:
                 log(job_id, f"识别到 {len(junk)} 条页眉/页脚，已移除")
             ordered = [strip_junk(t, junk) for t in ordered]
-        full = "\n\n".join(ordered)
-        full = merge_wrapped_lines(full)
-        (book_dir / "book.md").write_text(full, encoding="utf-8")
+        processed = []
+        for pno, text in zip(ordered_keys, ordered):
+            if text.startswith("!["):
+                processed.append({"page": pno, "text": text, "illustration": True})
+                continue
+            body_text, notes, next_note_id = extract_footnotes_from_page(text, pno, next_note_id)
+            body_text = collapse_repeated_paragraphs(merge_wrapped_lines(body_text))
+            if body_text:
+                processed.append({"page": pno, "text": body_text, "illustration": False})
+            if notes:
+                all_notes.extend(notes)
+        full = "\n\n".join(item["text"] for item in processed if item["text"])
+        full = collapse_repeated_paragraphs(full)
+        notes_md = ""
+        if all_notes:
+            note_lines = ["# 注释"]
+            for note in all_notes:
+                note_lines.append(f"{note['label']} {note['text']}".strip())
+            notes_md = "\n\n".join(note_lines)
+        book_md = render_note_refs_as_text(full)
+        if notes_md:
+            book_md = book_md.rstrip() + "\n\n" + notes_md + "\n"
+        (book_dir / "book.md").write_text(book_md, encoding="utf-8")
 
         # ---- 4. 可选：用已装的文本模型做校对 ----
         if cfg.get("proofread"):
@@ -953,18 +1237,52 @@ def run_job(job_id):
                     with JOBS_LOCK:
                         job["progress"] = 80 + int(15 * (i + 1) / len(chunks))
                 full = "\n\n".join(out)
-                (book_dir / "book.proofread.md").write_text(full, encoding="utf-8")
+                full = collapse_repeated_paragraphs(full)
+                proofread_md = render_note_refs_as_text(full)
+                if notes_md:
+                    proofread_md = proofread_md.rstrip() + "\n\n" + notes_md + "\n"
+                (book_dir / "book.proofread.md").write_text(proofread_md, encoding="utf-8")
+                book_md = proofread_md
 
         # ---- 5. 切章 + 打包 EPUB ----
         log(job_id, "切分章节并生成 EPUB")
-        chapters = split_chapters(full)
+        raw_chapters = split_chapters(full)
+        chapters = []
+        epub_notes = []
+        epub_note_ids = set()
+        for title0, body0 in raw_chapters:
+            chapter_notes = collect_note_refs_for_epub(body0, all_notes)
+            idx = len(chapters) + 1
+            fname = f"chap_{idx:04d}.xhtml"
+            for note in chapter_notes:
+                if note["id"] not in epub_note_ids:
+                    epub_notes.append({**note, "chapter_href": fname})
+                    epub_note_ids.add(note["id"])
+            chapters.append({
+                "title": title0,
+                "body": body0,
+                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
+            })
+        if not chapters:
+            chapter_notes = collect_note_refs_for_epub(full, all_notes)
+            for note in chapter_notes:
+                if note["id"] not in epub_note_ids:
+                    epub_notes.append({**note, "chapter_href": "chap_0001.xhtml"})
+                    epub_note_ids.add(note["id"])
+            chapters = [{
+                "title": "正文",
+                "body": full,
+                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
+            }]
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
-        build_epub(epub, job["title"], job.get("author", ""), chapters, lang=cfg.get("lang", "zh-CN"))
+        build_epub(epub, job["title"], job.get("author", ""), chapters,
+                   lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir, notes=epub_notes)
         md_out = book_dir / f"{slug}.md"
-        if not md_out.exists():
-            shutil.copyfile(book_dir / "book.md", md_out)
+        md_src = book_dir / ("book.proofread.md" if cfg.get("proofread") and (book_dir / "book.proofread.md").exists() else "book.md")
+        if md_src != md_out:
+            shutil.copyfile(md_src, md_out)
 
         with JOBS_LOCK:
             job["status"] = "done"
