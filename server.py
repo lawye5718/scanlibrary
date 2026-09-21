@@ -199,6 +199,14 @@ def ollama_loaded_models(base_url) -> list:
     except Exception:
         return []
 
+def available_memory_gb():
+    """粗略估算当前可用物理内存（GB）；失败返回 None。"""
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1e9
+    except Exception:
+        return None
+
+
 def ollama_unload(base_url, model) -> bool:
     """keep_alive=0 请求：让 Ollama 立即把模型移出内存。"""
     try:
@@ -388,14 +396,24 @@ def text_char_count(text: str) -> int:
     return len(re.findall(rf"[A-Za-z0-9{CJK}]", text or ""))
 
 
-def image_marker_md(img_path: Path, label: str = "插图") -> str:
-    return f"![{label}](images/{img_path.name})"
-
-
 def safe_epub_asset_name(name: str) -> str:
+    """EPUB 内资产文件名：只过滤危险字符，保留中文。
+
+    以前把所有非 ASCII 字符替换成 "-"，会让 "验证书_p1.jpg" 变成 "_p1.jpg"，
+    与正文引用不一致（裂图），还可能让不同文件撞名。此处仅清理真正危险的字符。
+    """
     base = Path(name).name
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip(".-")
+    safe = re.sub(r"[\x00-\x1f/\\:*?\"<>|\s]+", "-", base).strip(". -")
     return safe or "asset.bin"
+
+
+def image_marker_md(img_path: Path, label: str = "插图") -> str:
+    """正文插图标记。文件名必须与 build_epub 打包时所用命名一致，否则裂图。"""
+    return f"![{label}](images/{safe_epub_asset_name(img_path.name)})"
+
+
+# OCR 中间产物（降分辨率重试图、裁剪临时图）不应进入成品 EPUB
+EPUB_ASSET_SKIP_RE = re.compile(r"\.r\d{3,4}\.|_crop\.|\.crop\.|\.tmp\.")
 
 
 def likely_full_page_illustration(img_path: Path) -> bool:
@@ -508,8 +526,24 @@ NOTE_MARKER_RE = re.compile(
 )
 
 
+# 行首圈码（①②③…）常表示一条新注释，OCR 却只给单换行，需提升为段落边界
+NOTE_LINE_SPLIT_RE = re.compile(r"\n(?=\s*[\u2460-\u2473])")
+
+
+def _split_notes_into_paras(text: str) -> str:
+    """把多条注释之间的单换行提升为段落分隔。
+
+    实测 0010 页：OCR 把「①…」和「②…」挤在同一段（行间仅单换行），
+    不切开会导致提取时把后一条注释并进前一条的文本里。
+    """
+    if not text:
+        return text
+    return NOTE_LINE_SPLIT_RE.sub("\n\n", text)
+
+
 def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
-    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    paras = [p.strip() for p in re.split(r"\n\s*\n", _split_notes_into_paras(text or ""))
+             if p.strip()]
     body, notes = [], []
     half = max(1, len(paras) // 2)
     for idx, para in enumerate(paras):
@@ -628,12 +662,17 @@ def ollama_generate(base_url, model, prompt, images_b64=None, options=None, time
     return (data.get("response") or "").strip()
 
 
-def ollama_chat(base_url, model, prompt, options=None, timeout=600):
-    """调用 Ollama 原生 /api/chat 端点（纯文本模型，用于校对）。"""
+def ollama_chat(base_url, model, prompt, options=None, timeout=600, keep_alive="30m"):
+    """调用 Ollama 原生 /api/chat 端点（纯文本模型，用于校对）。
+
+    keep_alive 让模型在阶段内保持驻留（避免每段都冷加载）；
+    阶段切换时由调用方显式 ollama_unload 释放，避免两个大模型争内存。
+    """
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
+        "keep_alive": keep_alive,
     }
     if options:
         payload["options"] = options
@@ -796,6 +835,58 @@ def paddle_layout_detect(img_path: Path):
     return json.loads(out[-1])
 
 
+def _bbox_iou(a, b) -> float:
+    """两个 bbox 的交并比。"""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _bbox_cover(outer, inner) -> float:
+    """inner 被 outer 覆盖的面积比例。"""
+    ox1, oy1, ox2, oy2 = outer
+    ix1, iy1, ix2, iy2 = inner
+    x1, y1 = max(ox1, ix1), max(oy1, iy1)
+    x2, y2 = min(ox2, ix2), min(oy2, iy2)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    inner_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    return inter / inner_area if inner_area > 0 else 0.0
+
+
+def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
+    """丢弃互相重叠的版面框。
+
+    PP-Structure 常把同一区域同时标成 doc_title 与 text（或相邻 text 框交叠），
+    导致同一段文字被 glm-ocr 识别两次，落盘后表现为重复段落。
+    规则：按面积从大到小保留；与已保留框 IoU>=iou_thr，或被已保留框覆盖
+    >=cover_thr 的框丢弃（文字仍在大框内被 OCR，内容不会丢失）。
+    """
+    def _area(b):
+        x1, y1, x2, y2 = b["bbox"]
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
+    ordered = sorted(boxes, key=_area, reverse=True)
+    kept = []
+    for b in ordered:
+        bb = b.get("bbox")
+        if not bb or len(bb) != 4:
+            continue
+        if any(_bbox_iou(bb, k["bbox"]) >= iou_thr or _bbox_cover(k["bbox"], bb) >= cover_thr
+               for k in kept):
+            continue
+        kept.append(b)
+    return kept
+
+
 def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
     """PP-Structure 版面分析 + glm-ocr 文本识别。
     流程：
@@ -817,6 +908,7 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
     if not boxes:
         return NO_TEXT_TOKEN
 
+    boxes = dedupe_overlapping_boxes(boxes)
     img = Image.open(img_path).convert("RGB")
     W, H = img.size
     parts = []
@@ -900,13 +992,70 @@ def run_mineru(cfg, pdf_path: Path, work_dir: Path):
 CJK = r"\u4e00-\u9fff\u3040-\u30ff"
 
 
+# ---- 页级清理用正则（OCR 输出常见噪声，写入 pages/NNNN.md 前就地清掉）----
+PAGE_FENCE_PAIR_RE = re.compile(r"^\s*```[a-zA-Z0-9]*\s*$\n[\s\S]*?^\s*```\s*$", re.MULTILINE)
+PAGE_FENCE_BARE_RE = re.compile(r"^\s*```[a-zA-Z0-9]*\s*$", re.MULTILINE)
+# glm-ocr 把圈码脚注标号输出成 LaTeX 时 NOTE_MARKER_RE 认不出 → 转 Unicode 圈码
+PAGE_LATEX_CIRCLED_RE = re.compile(r"\$?\s*\\textcircled\s*\{\s*(\d{1,2})\s*\}\s*\$?")
+PAGE_LATEX_ORPHAN_RE = re.compile(r"\$\s*\\[a-zA-Z]+\s*\{?\d*\}?\s*\$")
+PAGE_PUNCT_RUN_RE = re.compile(r"([。，、；：！？…．,.;:!?])\1{1,}")
+PAGE_BROKEN_LINE_RE = re.compile(r"[·、，：；/\\—–－]\s*$")
+# 段内复读机：同一片段 8~400 字重复 2 次以上；同一短词重复 4 次以上
+PAGE_INLINE_DUP_RE = re.compile(r"(.{4,200}?)(?:\s*\1){2,}", re.DOTALL)
+PAGE_TOKEN_DUP_RE = re.compile(r"\b([A-Za-z\u4e00-\u9fff]{2,})\b(?:\s*\1\b){3,}")
+PAGE_SHORT_LINE_MAX = 30
+
+CIRCLED_NUMS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
+
+def _collapse_full_repeat(text: str) -> str:
+    """整段恰为同一子串的整数倍重复时（插图页 OCR 死循环），只保留一份。"""
+    n = len(text)
+    if n < 8:
+        return text
+    for size in range(1, n // 2 + 1):
+        if n % size == 0:
+            sub = text[:size]
+            if sub * (n // size) == text:
+                return sub
+    return text
+
+
+def _circled_repl(m) -> str:
+    n = int(m.group(1))
+    return CIRCLED_NUMS[n - 1] if 1 <= n <= 20 else f"({n})"
+
+
 def clean_page_text(text):
-    """去掉模型输出的所有代码围栏行（保留内部正文）与多余空行。
-    glm-ocr 在裁剪图上常重复输出 ``` 行（无内容），必须去掉。
+    """页级清理（OCR 结果落盘前调用）。
+
+    处理六类噪声：
+      1. 代码围栏（配对与孤立行）—— glm-ocr 在裁剪图上常重复输出 ```
+      2. LaTeX 圈码 → Unicode 圈码 —— 让 NOTE_MARKER_RE 能识别脚注标号
+      3. 孤立 LaTeX 片段
+      4. 连续相同标点（。。 → 。）
+      5. 段内复读机（同一片段/短词反复刷）
+      6. 断行残片（以 ·、，：； 等结尾的短行）
     """
-    text = re.sub(r"```[^\n]*\n?", "", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    if not text:
+        return text
     text = text.replace("\r\n", "\n")
+    text = PAGE_FENCE_PAIR_RE.sub("", text)
+    text = PAGE_FENCE_BARE_RE.sub("", text)
+    text = PAGE_LATEX_CIRCLED_RE.sub(_circled_repl, text)
+    text = PAGE_LATEX_ORPHAN_RE.sub("", text)
+    text = PAGE_PUNCT_RUN_RE.sub(r"\1", text)
+    text = PAGE_TOKEN_DUP_RE.sub(lambda m: m.group(1), text)
+    text = PAGE_INLINE_DUP_RE.sub(lambda m: m.group(1), text)
+    text = _collapse_full_repeat(text)
+    kept = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and len(s) <= PAGE_SHORT_LINE_MAX and PAGE_BROKEN_LINE_RE.search(s):
+            continue
+        kept.append(line)
+    text = "\n".join(kept)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -1162,6 +1311,8 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             for asset in sorted(assets_dir.iterdir()):
                 if not asset.is_file():
                     continue
+                if EPUB_ASSET_SKIP_RE.search(asset.name):
+                    continue          # 跳过 OCR 中间产物，别把重试图打进成品
                 mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
                 safe_name = safe_epub_asset_name(asset.name)
                 href = html.escape(f"images/{safe_name}", quote=True)
@@ -1356,6 +1507,23 @@ def run_job(job_id):
             if cached:
                 log(job_id, f"复用已完成页面 {cached} 页")
 
+            # ---- 资源隔离：OCR 阶段确保校对模型不常驻（两个大模型同驻会争内存→502）----
+            _url = cfg.get("ollama_url", "http://localhost:11434")
+            _mem = available_memory_gb()
+            if _mem is not None:
+                log(job_id, f"当前可用内存约 {_mem:.1f} GB")
+                if _mem < float(cfg.get("min_free_memory_gb", 8)):
+                    log(job_id, "⚠ 可用内存偏低，建议先关闭其他占内存的应用；"
+                                "否则大模型可能加载失败（HTTP 502 会表现为“校对未生效”）")
+            if cfg.get("free_memory_between_stages", True):
+                _proof_model = (cfg.get("proof_model") or "").strip() or "qwen14b-pro"
+                _stem = _proof_model.split(":")[0]
+                for _m in ollama_loaded_models(_url):
+                    if _m.split(":")[0] == _stem:
+                        if ollama_unload(_url, _m):
+                            log(job_id, f"OCR 开始前卸载校对模型 {_m}，释放内存")
+                        break
+
             ocr_fn = ocr_page_backend
             # Mac 上 Ollama 并发>1 会触发 llama-server 二次加载超时（HTTP 500），
             # 默认串行最稳；确有富余再手动调高
@@ -1372,6 +1540,9 @@ def run_job(job_id):
                     txt = ocr_fn(cfg, p)
                     if not txt or is_suspicious_ocr_text(txt):
                         raise RuntimeError("空结果")
+                    # 页级段落去重：版面框交叠、重试残留都会造成同页重复段，
+                    # 在落盘前就清掉，避免脏数据进入后续合并/EPUB（用户可见的重复段落）
+                    txt = collapse_repeated_paragraphs(txt)
                     (pages_dir / f"{pno:04d}.md").write_text(txt, encoding="utf-8")
                     with lock:
                         page_texts[pno] = txt
@@ -1451,6 +1622,19 @@ def run_job(job_id):
                 log(job_id, "未填写校对模型，跳过校对")
             else:
                 log(job_id, f"使用 {model} 逐段校对（较慢，可随时取消）")
+                # ---- 关键阶段切换：先卸载 OCR 模型，再加载校对模型 ----
+                _url = cfg.get("ollama_url", "http://localhost:11434")
+                if cfg.get("free_memory_between_stages", True):
+                    _ocr_stem = (cfg.get("ocr_model") or "glm-ocr").split(":")[0]
+                    for _m in ollama_loaded_models(_url):
+                        if _m.split(":")[0] == _ocr_stem:
+                            if ollama_unload(_url, _m):
+                                log(job_id, f"已卸载 OCR 模型 {_m}，为校对模型腾出内存")
+                            time.sleep(3)
+                            break
+                _mem2 = available_memory_gb()
+                if _mem2 is not None:
+                    log(job_id, f"校对前可用内存约 {_mem2:.1f} GB")
                 chunks = re.split(r"\n(?=#{1,6}\s|第[一二三四五六七八九十百千0-9]+[章节])", full)
                 chunks = [c for c in chunks if c.strip()]
                 out = []
@@ -1462,11 +1646,13 @@ def run_job(job_id):
                         continue
                     try:
                         r = ollama_chat(
-                            cfg.get("ollama_url", "http://localhost:11434"),
+                            _url,
                             model,
                             PROOFREAD_PROMPT + c,
-                            options={"temperature": 0.1},
+                            options={"temperature": 0.1,
+                                     "num_ctx": int(cfg.get("proof_num_ctx", 8192))},
                             timeout=int(cfg.get("proof_timeout", 900)),
+                            keep_alive="30m",
                         )
                         out.append(r or c)
                     except Exception as e:  # noqa
