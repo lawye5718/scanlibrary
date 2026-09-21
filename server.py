@@ -200,7 +200,25 @@ def ollama_loaded_models(base_url) -> list:
         return []
 
 def available_memory_gb():
-    """粗略估算当前可用物理内存（GB）；失败返回 None。"""
+    """估算当前可被立即回收的物理内存（GB）；失败返回 None。
+
+    macOS 不支持 SC_AVPHYS_PAGES（unrecognized configuration name），
+    因此首选 vm_stat 的 free + inactive + speculative 三个页面池
+    —— 它们都能被系统立刻回收给新进程使用。
+    """
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                             timeout=5).stdout
+        m = re.search(r"page size of (\d+) bytes", out)
+        page = int(m.group(1)) if m else 16384
+        vals = dict((k.strip(), int(v))
+                    for k, v in re.findall(r"([A-Za-z][A-Za-z \-]*?):\s*(\d+)\.", out))
+        pages = (vals.get("Pages free", 0) + vals.get("Pages inactive", 0)
+                 + vals.get("Pages speculative", 0))
+        if pages:
+            return pages * page / 1e9
+    except Exception:
+        pass
     try:
         return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 1e9
     except Exception:
@@ -662,15 +680,16 @@ def ollama_generate(base_url, model, prompt, images_b64=None, options=None, time
     return (data.get("response") or "").strip()
 
 
-def ollama_chat(base_url, model, prompt, options=None, timeout=600, keep_alive="30m"):
-    """调用 Ollama 原生 /api/chat 端点（纯文本模型，用于校对）。
+def ollama_chat_messages(base_url, model, messages, options=None, timeout=600,
+                        keep_alive="30m"):
+    """调用 Ollama 原生 /api/chat 端点，支持完整的 messages（system + user）。
 
     keep_alive 让模型在阶段内保持驻留（避免每段都冷加载）；
     阶段切换时由调用方显式 ollama_unload 释放，避免两个大模型争内存。
     """
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": False,
         "keep_alive": keep_alive,
     }
@@ -684,6 +703,14 @@ def ollama_chat(base_url, model, prompt, options=None, timeout=600, keep_alive="
     with urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return ((data.get("message") or {}).get("content") or "").strip()
+
+
+def ollama_chat(base_url, model, prompt, options=None, timeout=600, keep_alive="30m"):
+    """单条 user 消息的简易封装（保留兼容）。"""
+    return ollama_chat_messages(
+        base_url, model, [{"role": "user", "content": prompt}],
+        options=options, timeout=timeout, keep_alive=keep_alive,
+    )
 
 
 def _shrink_image(img_path: Path, max_side: int) -> Path:
@@ -1432,16 +1459,207 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
 # 主流水线
 # ---------------------------------------------------------------------------
 
-PROOFREAD_PROMPT = """你是古籍/中文图书校对助手。下面是一段 OCR 得到的正文，可能存在错别字、标点错误和错误的断行。
-请只做以下修正，不要改写、不要润色、不要增删内容、不要加解释：
-1. 修正明显的 OCR 错字（尤其是形近字、繁简混排、标点）；
-2. 修正错误的断行，让句子完整；
-3. 删除明显无意义的乱码符号、重复词句与重复段落；
-4. 保持原文的人名、地名、数字与专业术语不变。
-直接输出修正后的正文，不要任何开头说明。
+# 千问校对：强约束提示词 + 分块 + 兜底校验
+PROOF_CHUNK_CHARS = 700       # 每块目标字数（500~800 之间对本地模型最稳）
+PROOF_MIN_RATIO = 0.95        # 校对后长度 < 原文 95% → 判定偷懒省略
+PROOF_MAX_RATIO = 1.05        # 校对后长度 > 原文 105% → 判定幻觉扩写
+PROOF_MIN_SIMILARITY = 0.90   # 与原文相似度下限 → 判定改写润色
 
-正文：
-"""
+PROOFREAD_SYSTEM_PROMPT = """你是一个极其严谨的 OCR 文本校对员。你的唯一任务是修正 OCR 扫描产生的错别字、漏字、多余符号和标点错误，必须 100% 忠实于原文。
+
+【必须严格遵守】
+1. 只修正 OCR 误认的字：形近字（目/日、千/干、己/已/巳、未/末、刺/剌、1/l/I）、音近字、明显的错别字，以及多出来的乱码符号与错误标点。
+2. 绝对禁止润色、改写、缩写、扩写、翻译、总结或解释。原文通顺时保持原样。
+3. 绝对禁止用省略号（……）、“略”或任何方式代替原文内容，即使原文有错字也必须逐字输出。
+4. 不得增删句子，不得调整句子顺序，不得合并或拆分段落。
+5. 人名、地名、书名、数字、年代、注音符号一律保持原样，除非字形明显认错。
+6. 原文中的 Markdown 标记与像 [[NOTE_REF:12|③]] 这样的引注标记必须原样保留，一个字符都不能改动。
+7. 只输出校对后的正文本身，不要任何开场白、说明、标题或结尾语。"""
+
+PROOFREAD_USER_TEMPLATE = """请校对下面这段文本。
+
+【示例输入】
+第—章，宇宙的起原。
+在很久很久以别，宇审是一个极小的奇点。这#里包含了所有的物质@和能量。
+
+【示例输出】
+第一章，宇宙的起源。
+在很久很久以前，宇宙是一个极小的奇点。这里包含了所有的物质和能量。
+
+【本次待校对文本】
+{chunk}
+
+【输出要求】
+请直接输出校对后的【本次待校对文本】，不要输出任何多余的字符。"""
+
+
+def split_for_proofread(text: str, max_chars: int = PROOF_CHUNK_CHARS) -> list:
+    """按段落把长文切成 max_chars 左右的小块，供本地模型逐块校对。
+
+    旧实现按“章”切块并要求 len<=6000，超长章节直接跳过 —— 等于几乎没校对。
+    这里改为 500~900 字的细块：显存占用低、注意力集中、复读机概率大幅下降。
+    """
+    paras = [q for q in re.split(r"\n\s*\n", text or "") if q.strip()]
+    chunks, cur = [], ""
+    for para in paras:
+        if len(para) > max_chars:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            sents = re.split(r"(?<=[。！？；!?;])\s*", para)
+            buf = ""
+            for s in sents:
+                if buf and len(buf) + len(s) > max_chars:
+                    chunks.append(buf)
+                    buf = ""
+                while len(s) > max_chars:
+                    chunks.append(s[:max_chars])
+                    s = s[max_chars:]
+                buf += s
+            if buf:
+                chunks.append(buf)
+            continue
+        if cur and len(cur) + len(para) + 2 > max_chars:
+            chunks.append(cur)
+            cur = ""
+        cur = (cur + "\n\n" + para) if cur else para
+    if cur:
+        chunks.append(cur)
+    return [c for c in chunks if c.strip()]
+
+
+# 私用区占位符：[[NOTE_REF:12|③]] -> PUA(12)（模型不认识，通常原样带过）
+NOTE_PLACEHOLDER_RE = re.compile(r"\ue000(\d+)\ue001")
+
+
+def protect_note_refs(text: str):
+    """把引注标记换成占位符，防止模型改坏。返回 (受保护文本, {id: 原标记})。"""
+    saved = {}
+
+    def repl(m):
+        nid = int(m.group(1))
+        saved[nid] = m.group(0)
+        return f"\ue000{nid}\ue001"
+
+    return NOTE_REF_RE.sub(repl, text or ""), saved
+
+
+def restore_note_refs(text: str, saved: dict):
+    """还原占位符，返回 (文本, 期望条数, 实际还原条数)。"""
+    found = set()
+
+    def repl(m):
+        nid = int(m.group(1))
+        found.add(nid)
+        return saved.get(nid, "")
+
+    return NOTE_PLACEHOLDER_RE.sub(repl, text or ""), len(saved), len(found)
+
+
+def _proof_norm(s: str) -> str:
+    """比对用归一化：只去空白，避免换行/分块边界造成误判。"""
+    return re.sub(r"\s+", "", s or "")
+
+
+def proofread_chunk_guard(orig: str, fixed: str, low=None, high=None, sim_min=None):
+    """兜底校验：长度偏差过大或相似度过低 → 判定模型偷懒/幻觉。
+
+    返回 (是否通过, 原因)。不通过时调用方必须回退原文。
+    """
+    low = PROOF_MIN_RATIO if low is None else low
+    high = PROOF_MAX_RATIO if high is None else high
+    sim_min = PROOF_MIN_SIMILARITY if sim_min is None else sim_min
+    a, b = _proof_norm(orig), _proof_norm(fixed)
+    if not b:
+        return False, "模型返回空"
+    if not a:
+        return True, ""
+    ratio = len(b) / len(a)
+    if ratio < low:
+        return False, f"长度仅剩 {ratio:.0%}（疑似偷懒省略）"
+    if ratio > high:
+        return False, f"长度涨到 {ratio:.0%}（疑似幻觉扩写）"
+    if len(a) > 12:
+        sim = difflib.SequenceMatcher(None, a, b).ratio()
+        if sim < sim_min:
+            return False, f"相似度仅 {sim:.0%}（疑似改写润色）"
+    return True, ""
+
+
+def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
+                       job_id: str, log_fn, progress_cb=None) -> str:
+    """用本地千问逐块校对正文，任何异常/越界一律回退该块原文。
+
+    工程约束（对应“防崩溃、防偷懒”）：
+      · 分块 500~900 字，块间上下文隔离，避免长文注意力崩溃与复读机；
+      · temperature=0.0 / top_p=0.1，剥夺发挥空间；
+      · num_predict 按块长设定，防跑飞；
+      · 每块做长度比例 + 相似度兜底，不合格就原样保留；
+      · 引注标记先转占位符，丢失即判该块失败，避免注释与章节脱钩。
+    """
+    chunk_chars = int(cfg.get("proof_chunk_chars", PROOF_CHUNK_CHARS))
+    low = float(cfg.get("proof_len_ratio_low", PROOF_MIN_RATIO))
+    high = float(cfg.get("proof_len_ratio_high", PROOF_MAX_RATIO))
+    sim_min = float(cfg.get("proof_similarity_min", PROOF_MIN_SIMILARITY))
+    chunks = split_for_proofread(text, chunk_chars)
+    total = len(chunks)
+    log_fn(job_id, f"校对分块 {total} 块（约 {chunk_chars} 字/块，temperature=0.0、"
+                   f"top_p=0.1，逐块做长度/相似度兜底）")
+    out, n_ok, n_fallback, n_changed = [], 0, 0, 0
+    for i, c in enumerate(chunks):
+        if CANCEL_FLAGS.get(job_id):
+            raise RuntimeError("已取消")
+        protected, saved = protect_note_refs(c)
+        messages = [
+            {"role": "system", "content": PROOFREAD_SYSTEM_PROMPT},
+            {"role": "user", "content": PROOFREAD_USER_TEMPLATE.format(chunk=protected)},
+        ]
+        options = {
+            "temperature": 0.0,
+            "top_p": 0.1,
+            "num_ctx": int(cfg.get("proof_num_ctx", 8192)),
+            "num_predict": max(1024, int(len(protected) * 2.5)),
+        }
+        try:
+            raw = ollama_chat_messages(
+                base_url, model, messages, options=options,
+                timeout=int(cfg.get("proof_timeout", 900)), keep_alive="30m",
+            )
+        except Exception as e:  # noqa
+            log_fn(job_id, f"第 {i + 1}/{total} 块请求失败，保留原文：{e}")
+            out.append(c)
+            n_fallback += 1
+            if progress_cb:
+                progress_cb(i + 1, total)
+            continue
+
+        restored, expected, got = restore_note_refs(raw, saved)
+        if expected and got < expected:
+            log_fn(job_id, f"第 {i + 1}/{total} 块丢失引注标记（{got}/{expected}），保留原文")
+            out.append(c)
+            n_fallback += 1
+            if progress_cb:
+                progress_cb(i + 1, total)
+            continue
+
+        ok, why = proofread_chunk_guard(c, restored, low, high, sim_min)
+        if not ok:
+            log_fn(job_id, f"第 {i + 1}/{total} 块判为不合格（{why}），保留原文")
+            out.append(c)
+            n_fallback += 1
+        else:
+            if _proof_norm(restored) != _proof_norm(c):
+                n_changed += 1
+            out.append(restored)
+            n_ok += 1
+        if (i + 1) % 10 == 0:
+            log_fn(job_id, f"校对进度 {i + 1}/{total} 块（通过 {n_ok}，回退 {n_fallback}）")
+        if progress_cb:
+            progress_cb(i + 1, total)
+
+    log_fn(job_id, f"校对完成：{n_ok} 块通过（其中 {n_changed} 块有改动），"
+                   f"{n_fallback} 块回退原文")
+    return "\n\n".join(out)
 
 
 def run_job(job_id):
@@ -1635,32 +1853,12 @@ def run_job(job_id):
                 _mem2 = available_memory_gb()
                 if _mem2 is not None:
                     log(job_id, f"校对前可用内存约 {_mem2:.1f} GB")
-                chunks = re.split(r"\n(?=#{1,6}\s|第[一二三四五六七八九十百千0-9]+[章节])", full)
-                chunks = [c for c in chunks if c.strip()]
-                out = []
-                for i, c in enumerate(chunks):
-                    if CANCEL_FLAGS.get(job_id):
-                        raise RuntimeError("已取消")
-                    if len(c) > 6000:
-                        out.append(c)
-                        continue
-                    try:
-                        r = ollama_chat(
-                            _url,
-                            model,
-                            PROOFREAD_PROMPT + c,
-                            options={"temperature": 0.1,
-                                     "num_ctx": int(cfg.get("proof_num_ctx", 8192))},
-                            timeout=int(cfg.get("proof_timeout", 900)),
-                            keep_alive="30m",
-                        )
-                        out.append(r or c)
-                    except Exception as e:  # noqa
-                        log(job_id, f"第 {i + 1} 段校对失败，保留原文：{e}")
-                        out.append(c)
+                def _proof_progress(done, total_chunks, _job=job):
                     with JOBS_LOCK:
-                        job["progress"] = 80 + int(15 * (i + 1) / len(chunks))
-                full = "\n\n".join(out)
+                        _job["progress"] = 80 + int(15 * done / max(1, total_chunks))
+
+                full = proofread_with_llm(full, _url, model, cfg, job_id, log,
+                                          progress_cb=_proof_progress)
                 full = collapse_repeated_paragraphs(full)
                 proofread_md = render_note_refs_as_text(full)
                 if notes_md:

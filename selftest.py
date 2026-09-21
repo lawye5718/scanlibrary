@@ -20,6 +20,80 @@ server.PASSWORD[0] = "testpw123"
 server.ensure_dirs()
 threading.Thread(target=server.worker_loop, daemon=True).start()
 
+# ---------- 校对引擎校验（离线，用假模型，不依赖本地大模型）----------
+_pad = "正文文字七字。" * 10
+_paras = [f"第{i}段。" + _pad for i in range(1, 7)]
+_paras[0] = "第一段。他说道这是第—段的正文。" + _pad
+_paras[3] = "第四段。有引注[[NOTE_REF:5|⑤]]的正文。" + _pad
+_paras[5] = "第六段。这段正常校队通过。" + _pad
+_book = "\n\n".join(_paras)
+
+# 分块：每段独立成块、块长受限、内容守恒
+assert len(server.split_for_proofread(_book, 120)) == 6
+_long = "句子一句。" * 200
+_chks = server.split_for_proofread(_long, 200)
+assert len(_chks) > 1 and all(len(c) <= 200 for c in _chks)
+assert server._proof_norm("".join(_chks)) == server._proof_norm(_long)
+
+# 引注标记保护：往返一致、丢失可检出
+_prot, _saved = server.protect_note_refs("甲[[NOTE_REF:7|③]]乙")
+assert "NOTE_REF" not in _prot and len(_saved) == 1
+assert server.restore_note_refs(_prot, _saved)[0] == "甲[[NOTE_REF:7|③]]乙"
+assert server.restore_note_refs("甲乙", _saved)[2] == 0
+
+# 兜底判定
+_o = "他说道：“这是—个很好的例子。”他说完就离开了房间，天已经黑了。"
+assert server.proofread_chunk_guard(_o, _o.replace("—", "一"))[0]
+assert not server.proofread_chunk_guard(_o, _o[:20])[0]        # 偷懒截断
+assert not server.proofread_chunk_guard(_o, _o + "补写" * 20)[0]  # 幻觉扩写
+assert not server.proofread_chunk_guard(_o, "")[0]             # 空返回
+assert server.proofread_chunk_guard("甲乙丙丁戊己庚辛", "甲乙丙丁 戊己庚辛")[0]
+
+# 端到端（假模型）：正常 / 偷懒 / 幻觉 / 丢标记 / 异常 五类场景
+_calls, _opts = {"n": 0}, []
+
+
+def _fake_chat(base, model, messages, options=None, timeout=600, keep_alive="30m"):
+    _calls["n"] += 1
+    _opts.append(options)
+    i = _calls["n"]
+    body = messages[1]["content"].split("【本次待校对文本】\n", 1)[1] \
+                              .rsplit("\n\n【输出要求】", 1)[0]
+    if i == 1:
+        return body.replace("—", "一")
+    if i == 2:
+        return body[:len(body) // 2]
+    if i == 3:
+        return body + "幻觉内容" * 10
+    if i == 4:
+        return body.replace("\ue0005\ue001", "")
+    if i == 5:
+        raise RuntimeError("boom")
+    return body.replace("校队", "校对")
+
+
+_real, server.ollama_chat_messages = server.ollama_chat_messages, _fake_chat
+_logs = []
+try:
+    _out = server.proofread_with_llm(_book, "http://x", "fake",
+                                    {"proof_chunk_chars": 120}, "t",
+                                    lambda j, m: _logs.append(m))
+finally:
+    server.ollama_chat_messages = _real
+
+assert _calls["n"] == 6
+assert "第一段。他说道这是第一段的正文" in _out                     # 正常→采纳
+assert "这段正常校对通过" in _out                                  # 正常→采纳
+assert _paras[1] in _out and _paras[2] in _out and _paras[4] in _out  # 偷懒/幻觉/异常→回退
+assert "[[NOTE_REF:5|⑤]]" in _out                                 # 丢标记→回退
+assert all(o["temperature"] == 0.0 and o["top_p"] == 0.1 for o in _opts)  # 低温确定性
+assert all(any(k in m for m in _logs) for k in
+           ("疑似偷懒省略", "疑似幻觉扩写", "丢失引注标记", "请求失败", "校对完成"))
+assert "省略号" in server.PROOFREAD_SYSTEM_PROMPT
+assert "禁止润色" in server.PROOFREAD_SYSTEM_PROMPT
+assert "测试块" in server.PROOFREAD_USER_TEMPLATE.format(chunk="测试块")
+print("✅ 校对引擎单测通过（分块守恒/引注保护/兜底判定/五类场景回退/低温参数）")
+
 srv = server.Server(("127.0.0.1", 8801), server.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(0.5)
