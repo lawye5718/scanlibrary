@@ -308,11 +308,13 @@ stitched = server.merge_wrapped_lines(server.join_processed_pages([
     {"page": 2, "text": "下一页接着写完。\n\n新一段。", "illustration": False},
 ]))
 assert stitched.split("\n") == ["这一段跨页未完下一页接着写完。", "", "新一段。"], stitched
+# 跨页相似去重已停用（2026-09-21）：页间重复段暂时保留，待重新调优后再启用。
+# 重新启用时，应恢复断言：removed == 1 且 deduped_pages[1]["text"] == "丙段。"
 deduped_pages, removed = server.dedupe_processed_pages([
     {"page": 1, "text": "甲段。\n\n乙段。", "illustration": False},
     {"page": 2, "text": "乙段。\n\n丙段。", "illustration": False},
 ])
-assert removed == 1 and deduped_pages[1]["text"] == "丙段。", deduped_pages
+assert removed == 0 and deduped_pages[1]["text"] == "乙段。\n\n丙段。", deduped_pages
 print("✅ 注释抽取不会打乱正文")
 
 manual_processed = [
@@ -597,6 +599,175 @@ finally:
     server.save_jobs()
     shutil.rmtree(tb, ignore_errors=True)
     shutil.rmtree(sd, ignore_errors=True)
+
+# ==================== 暂停/停止 + 页级立即去重 E2E + 分章复核 ====================
+from urllib.parse import quote as _q
+
+# --- A. 单元复核：跨页相似去重已停用，页内段首去重仍生效 ---
+two = [{"page": 1, "text": "同一段落在相邻两页重复出现应当保留原样。", "illustration": False},
+       {"page": 2, "text": "同一段落在相邻两页重复出现应当保留原样。", "illustration": False}]
+outp, rmv = server.dedupe_processed_pages(two)
+assert len(outp) == 2 and rmv == 0, (len(outp), rmv)   # 跨页段落级去重已注释停用
+one = [{"page": 1, "text": "重复开头的内容一段。\n\n重复开头的内容一段。\n\n重复开头的内容二段。",
+        "illustration": False}]
+outp1, rmv1 = server.dedupe_processed_pages(one)
+assert rmv1 == 2 and outp1[0]["text"].count("重复开头的内容") == 1, outp1  # 页内仍去重
+print("✅ 跨页相似去重已停用 / 页内段首去重仍生效")
+
+# --- B. 端到端：stub 注入每页文本，验证"生成 md 后立刻去重"+自动分章 ---
+PAGES_FAKE = {
+    1: "去重验证书",
+    2: "去重验证书\n\n测试作者 著",
+    3: "书号 ISBN 978-7-02-015894-5\n\n出版发行：测试出版社\n\n版权所有 翻版必究",
+    4: "目 录\n\n第一章起始…1\n\n第二章结尾…2",
+    5: ("这是重复段落的开头部分第一句内容。\n\n"
+        "这是重复段落的开头部分第一句内容。\n\n"
+        "这是重复段落的开头部分第二句不同的内容。\n\n"
+        "正常的独立段落保持原样不动。"),
+    6: ("第二章结尾\n\n这是最后一章的正文内容，讲述整个故事从开始到结束的完整过程。\n\n"
+        "所有的人物都在最后得到了归宿，故事在这里画上了圆满的句号，感谢阅读本书。"),
+}
+_real_stub = server.ocr_page_stub
+
+
+def _fake_stub(cfg, img_path, attempt=1):
+    n = int(img_path.stem.split("_")[-1])
+    return PAGES_FAKE.get(n, "占位正文。")
+
+
+server.ocr_page_stub = _fake_stub
+docA = pymupdf.open()
+for i in range(6):
+    pg = docA.new_page()
+    pg.insert_text((72, 100), f"Dedup E2E page {i+1}.")
+pdfA = docA.tobytes()
+docA.close()
+
+cfgd = {"book_title": "去重验证书", "author": "测试作者", "backend": "stub"}
+rd = post("/api/upload", pdfA, {
+    "Content-Type": "application/octet-stream",
+    "X-Title": _q("去重验证书"), "X-Author": _q("测试作者"),
+    "X-Filename": _q("去重验证书.pdf"),
+    "X-Config": __import__("base64").b64encode(json.dumps(cfgd).encode()).decode()})
+jidd = rd["job"]["id"]
+t0 = time.time()
+while time.time() - t0 < 60:
+    sd = json.loads(get(f"/api/job/{jidd}"))
+    if sd["status"] in ("done", "error"):
+        break
+    time.sleep(0.2)
+assert sd["status"] == "done", sd
+logs_d = "\n".join(sd.get("log") or [])
+assert "段首去重" in logs_d, "应有页级段首去重日志"
+assert "自动识别结构页" in logs_d, "应有自动结构页识别日志"
+book_dir_d = ROOT / "books" / sd["slug"]
+p5 = (book_dir_d / "pages" / "0005.md").read_text(encoding="utf-8")
+# 关键验证：去重发生在"生成 md 后立刻"——缓存文件本身就是干净的
+assert p5.count("这是重复段落的开头部分") == 1, p5
+# 前缀"这是重复段落的开头部分第"（含"第"字）共 14 字被裁，余下"二句不同的内容。"
+assert "二句不同的内容" in p5 and "正常的独立段落保持原样不动" in p5, p5
+book_md_d = (book_dir_d / "book.md").read_text(encoding="utf-8")
+for h in ("# 封面", "# 扉页", "# 版权页", "# 目录", "# 第一章起始", "# 第二章结尾"):
+    assert h in book_md_d, (h, book_md_d[:300])
+assert book_md_d.count("这是重复段落的开头部分") == 1
+server.ocr_page_stub = _real_stub
+print("✅ 页级去重 E2E：pages/0005.md 落盘即干净 + 自动结构页分章正确")
+
+# --- C. 暂停 / 恢复：挂起期间进度冻结，恢复后正常完成 ---
+def _slow_stub(cfg, img_path, attempt=1):
+    time.sleep(0.4)
+    n = int(img_path.stem.split("_")[-1])
+    return f"慢速第{n}页占位正文，验证暂停与停止功能。"
+
+
+server.ocr_page_stub = _slow_stub
+docB = pymupdf.open()
+for i in range(8):
+    pg = docB.new_page()
+    pg.insert_text((72, 100), f"Pause test page {i+1}.")
+pdfB = docB.tobytes()
+docB.close()
+
+cfgp = {"book_title": "暂停测试书", "author": "测试作者", "backend": "stub"}
+rp = post("/api/upload", pdfB, {
+    "Content-Type": "application/octet-stream",
+    "X-Title": _q("暂停测试书"), "X-Author": _q("测试作者"),
+    "X-Filename": _q("暂停测试书.pdf"),
+    "X-Config": __import__("base64").b64encode(json.dumps(cfgp).encode()).decode()})
+jidp = rp["job"]["id"]
+t0 = time.time()
+while time.time() - t0 < 20:
+    sp = json.loads(get(f"/api/job/{jidp}"))
+    if sp["status"] == "running" and sp.get("progress", 0) >= 8:
+        break
+    assert sp["status"] not in ("error",), sp
+    time.sleep(0.1)
+pr = post(f"/api/pause/{jidp}", b"{}", {"Content-Type": "application/json"})
+assert pr.get("ok"), pr
+time.sleep(1.5)  # 当前页 OCR 完成后进入挂起
+sp = json.loads(get(f"/api/job/{jidp}"))
+assert sp["status"] == "running" and sp.get("paused"), sp
+prog_frozen = sp.get("progress", 0)
+time.sleep(1.2)  # 挂起期间进度不应变化
+sp = json.loads(get(f"/api/job/{jidp}"))
+assert sp.get("paused") and sp.get("progress", 0) == prog_frozen, (prog_frozen, sp)
+assert "暂停" in (sp.get("message") or ""), sp
+rs = post(f"/api/resume/{jidp}", b"{}", {"Content-Type": "application/json"})
+assert rs.get("ok"), rs
+t0 = time.time()
+while time.time() - t0 < 90:
+    sp = json.loads(get(f"/api/job/{jidp}"))
+    if sp["status"] in ("done", "error"):
+        break
+    time.sleep(0.2)
+assert sp["status"] == "done", sp
+print("✅ 暂停/恢复：挂起时进度冻结，恢复后正常完成")
+
+# --- D. 停止 → stopped 状态 → 续跑（断点继续） ---
+docC = pymupdf.open()
+for i in range(7):
+    pg = docC.new_page()
+    pg.insert_text((72, 100), f"Stop test page {i+1}.")
+pdfC = docC.tobytes()
+docC.close()
+cfgs = {"book_title": "停止测试书", "author": "测试作者", "backend": "stub"}
+rst = post("/api/upload", pdfC, {
+    "Content-Type": "application/octet-stream",
+    "X-Title": _q("停止测试书"), "X-Author": _q("测试作者"),
+    "X-Filename": _q("停止测试书.pdf"),
+    "X-Config": __import__("base64").b64encode(json.dumps(cfgs).encode()).decode()})
+jidst = rst["job"]["id"]
+t0 = time.time()
+while time.time() - t0 < 20:
+    ss = json.loads(get(f"/api/job/{jidst}"))
+    if ss["status"] == "running" and ss.get("progress", 0) >= 8:
+        break
+    assert ss["status"] not in ("error",), ss
+    time.sleep(0.1)
+cs = post(f"/api/cancel/{jidst}", b"{}", {"Content-Type": "application/json"})
+assert cs.get("ok"), cs
+t0 = time.time()
+while time.time() - t0 < 30:
+    ss = json.loads(get(f"/api/job/{jidst}"))
+    if ss["status"] == "stopped":
+        break
+    time.sleep(0.2)
+assert ss["status"] == "stopped" and not ss.get("error"), ss
+# message 会被 log() 更新为最后一条日志（"任务已由用户停止…"）
+assert "停止" in (ss.get("message") or ""), ss
+# 续跑：换回快速 stub，已完成页走缓存，剩余页快速完成
+server.ocr_page_stub = _fake_stub
+r3b = post(f"/api/retry/{jidst}", b"{}", {"Content-Type": "application/json"})
+assert r3b.get("ok"), r3b
+t0 = time.time()
+while time.time() - t0 < 60:
+    ss = json.loads(get(f"/api/job/{jidst}"))
+    if ss["status"] in ("done", "error"):
+        break
+    time.sleep(0.2)
+assert ss["status"] == "done", ss
+server.ocr_page_stub = _real_stub
+print("✅ 停止→stopped 状态→续跑（断点继续）全链路通过")
 
 # 断点续跑
 json.loads(get(f"/api/job/{jid2}"))

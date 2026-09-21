@@ -69,6 +69,7 @@ JOBS = {}                   # job_id -> job dict
 JOBS_LOCK = threading.Lock()
 TASK_QUEUE: "queue.Queue[str]" = queue.Queue()
 CANCEL_FLAGS = {}           # job_id -> True 表示请求取消
+PAUSE_FLAGS = {}             # job_id -> True 表示请求暂停（当前页完成后挂起，可随时恢复）
 LOG_BUFFERS = {}            # job_id -> list[str]
 
 # ---- 认证 / 空闲模型管理 / 历史耗时统计 ----
@@ -865,11 +866,15 @@ def dedupe_processed_pages(processed: list[dict], similarity=0.9,
             paras, min_shared=prefix_min_shared or PREFIX_DEDUPE_MIN_SHARED)
         if pref_trim or pref_rm:
             removed += pref_trim + pref_rm
-        # 第二遍：跨页历史窗口相似度去重
-        kept, rm, recent_norms = dedupe_paragraphs_with_history(
-            paras, recent_norms=recent_norms, similarity=similarity
-        )
-        removed += rm
+        # 第二遍：跨页历史窗口相似度去重 —— 暂时停用（2026-09-21）：
+        # 与页内段首去重叠加时对正常段有误伤，待重新调优相似度阈值后再启用；
+        # 页内段首去重（第一遍）与整页重复剔除（looks_like_duplicate_page）不受影响。
+        # kept, rm, recent_norms = dedupe_paragraphs_with_history(
+        #     paras, recent_norms=recent_norms, similarity=similarity
+        # )
+        # removed += rm
+        kept = paras
+        rm = 0
         text = "\n\n".join(kept).strip()
         if text:
             nxt = dict(item)
@@ -2543,8 +2548,8 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
         return True, restored, ""
 
     for i, c in enumerate(chunks):
-        if CANCEL_FLAGS.get(job_id):
-            raise RuntimeError("已取消")
+        if wait_if_paused(job_id) or CANCEL_FLAGS.get(job_id):
+            raise JobStopped()
         parent_idx = i + 1
         parent_label = f"{parent_idx}"
         ok, fixed, why = _run_one(c, parent_label, parent_idx, total)
@@ -2561,8 +2566,8 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
                 log_fn(job_id, f"第 {parent_idx}/{total} 块未通过（{why}），对半切开重试一次")
                 sub_results = []
                 for k, sub in enumerate(subs):
-                    if CANCEL_FLAGS.get(job_id):
-                        raise RuntimeError("已取消")
+                    if wait_if_paused(job_id) or CANCEL_FLAGS.get(job_id):
+                        raise JobStopped()
                     sub_label = f"{parent_idx}.{k + 1}"
                     sub_ok, sub_fixed, sub_why = _run_one(sub, sub_label, parent_idx, total)
                     sub_changed = sub_ok and _proof_norm(sub_fixed) != _proof_norm(sub)
@@ -2729,6 +2734,30 @@ def _proofread_summary(model, snap, records):
     }
 
 
+def wait_if_paused(job_id):
+    """暂停挂起：每秒检查一次，直到用户恢复或停止。
+
+    挂起期间任务状态保持 running、进度保留；恢复后从中断处继续。
+    返回 True 表示挂起期间收到了停止请求。
+    """
+    if not PAUSE_FLAGS.get(job_id):
+        return False
+    announced = False
+    while PAUSE_FLAGS.get(job_id) and not CANCEL_FLAGS.get(job_id):
+        if not announced:
+            with JOBS_LOCK:
+                j = JOBS.get(job_id)
+                if j:
+                    j["message"] = "已暂停（进度已保留，点「恢复」继续）"
+            announced = True
+        time.sleep(1)
+    return CANCEL_FLAGS.get(job_id) is True
+
+
+class JobStopped(Exception):
+    """用户主动停止任务（非错误；已完成页保留在缓存，可续跑）。"""
+
+
 def run_job(job_id):
     """后台执行一个转换任务。"""
     with JOBS_LOCK:
@@ -2824,6 +2853,7 @@ def run_job(job_id):
             t0 = time.time()
 
             def work(item):
+                wait_if_paused(job_id)  # 暂停挂起点：每页开始前
                 if CANCEL_FLAGS.get(job_id):
                     return
                 pno, p = item
@@ -2834,6 +2864,11 @@ def run_job(job_id):
                     # 页级段落去重：版面框交叠、重试残留都会造成同页重复段，
                     # 在落盘前就清掉，避免脏数据进入后续合并/EPUB（用户可见的重复段落）
                     txt = collapse_repeated_paragraphs(txt)
+                    # 段首递归比对去重：每页 md 生成后立刻执行（用户约定算法），
+                    # 保证写进 pages/NNNN.md 缓存的即为去重后的干净文本
+                    txt, _pt, _pr = dedupe_page_paragraph_prefixes(txt)
+                    if _pt or _pr:
+                        log(job_id, f"第 {pno} 页段首去重：裁 {_pt} 段重复前缀、删 {_pr} 个整段重复")
                     (pages_dir / f"{pno:04d}.md").write_text(txt, encoding="utf-8")
                     with lock:
                         page_texts[pno] = txt
@@ -2863,8 +2898,9 @@ def run_job(job_id):
                 log(job_id, f"本批 OCR 速度 {ocr_elapsed / len(todo):.1f} 秒/页"
                             f"（并发 {concurrency}），已计入历史统计")
 
+            wait_if_paused(job_id)  # 暂停挂起点：全部页完成后、后处理前
             if CANCEL_FLAGS.get(job_id):
-                raise RuntimeError("已取消")
+                raise JobStopped()
 
         # ---- 3. 后处理 ----
         log(job_id, "清理页眉页脚、合并断行与注释")
@@ -2897,7 +2933,7 @@ def run_job(job_id):
             similarity=float(cfg.get("dedupe_similarity") or 0.9),
             prefix_min_shared=int(cfg.get("prefix_dedupe_min_shared") or 0))
         if dedup_removed:
-            log(job_id, f"跨页去重删除 {dedup_removed} 段重复正文")
+            log(job_id, f"合并前段首去重共删除 {dedup_removed} 段重复正文（跨页相似去重已停用）")
         structured_chapters = []
         # 自动结构页识别（默认开启，可关掉只走人工/全书签路径）
         auto_pages = {}
@@ -3023,6 +3059,13 @@ def run_job(job_id):
             job["chapters"] = len(chapters)
             job["message"] = f"完成：{len(chapters)} 章 / {epub.stat().st_size // 1024} KB"
         log(job_id, f"完成，EPUB 已保存到 {epub}")
+    except JobStopped:
+        with JOBS_LOCK:
+            job["status"] = "stopped"
+            job["error"] = None
+            job["message"] = (f"已停止（已完成约 {job.get('progress', 0)}%，"
+                              f"进度保留在缓存，点「续跑」从断点继续）")
+        log(job_id, "任务已由用户停止，已完成页保留在 pages/ 缓存，可随时续跑")
     except Exception as e:  # noqa
         with JOBS_LOCK:
             job["status"] = "error"
@@ -3031,6 +3074,7 @@ def run_job(job_id):
         log(job_id, f"失败：{e}")
     finally:
         CANCEL_FLAGS.pop(job_id, None)
+        PAUSE_FLAGS.pop(job_id, None)
         save_jobs()
 
 
@@ -3117,6 +3161,12 @@ def run_proofread_job(job_id):
         log(job_id, f"校对对照表：{Path(report['html']).name}"
                     f"（{summary['edits']} 处改动已逐条列出，请人工确认）")
         log(job_id, f"完成，EPUB 已按校对后正文重建：{epub}")
+    except JobStopped:
+        with JOBS_LOCK:
+            job["status"] = "stopped"
+            job["error"] = None
+            job["message"] = "已停止（校对进度不保留，可重新开始校对）"
+        log(job_id, "校对任务已由用户停止")
     except Exception as e:  # noqa
         with JOBS_LOCK:
             job["status"] = "error"
@@ -3125,6 +3175,7 @@ def run_proofread_job(job_id):
         log(job_id, f"校对失败：{e}")
     finally:
         CANCEL_FLAGS.pop(job_id, None)
+        PAUSE_FLAGS.pop(job_id, None)
         save_jobs()
 
 
@@ -3166,6 +3217,7 @@ def job_public(jid):
             return None
         d = {k: v for k, v in j.items() if k != "_future"}
         d["id"] = jid
+        d["paused"] = bool(PAUSE_FLAGS.get(jid))  # 暂停中（状态仍为 running）
         if d.get("epub_path") and Path(d["epub_path"]).exists():
             d["download_url"] = f"/api/download/{jid}"
             d["reveal_url"] = f"/api/reveal/{jid}"
@@ -3513,11 +3565,37 @@ class Handler(BaseHTTPRequestHandler):
 
         m = re.match(r"^/api/cancel/([a-f0-9\-]+)$", p)
         if m:
-            CANCEL_FLAGS[m.group(1)] = True
+            jid = m.group(1)
+            CANCEL_FLAGS[jid] = True
+            PAUSE_FLAGS.pop(jid, None)  # 停止同时解除暂停（让挂起的循环退出）
             with JOBS_LOCK:
-                j = JOBS.get(m.group(1))
+                j = JOBS.get(jid)
                 if j:
-                    j["message"] = "正在取消…"
+                    j["message"] = "正在停止（当前页完成后生效，进度保留可续跑）…"
+            self.send_json({"ok": True})
+            return
+
+        m = re.match(r"^/api/pause/([a-f0-9\-]+)$", p)
+        if m:
+            jid = m.group(1)
+            with JOBS_LOCK:
+                j = JOBS.get(jid)
+                if not j or j["status"] != "running":
+                    self.send_json({"error": "任务不在运行状态"}, 400)
+                    return
+                PAUSE_FLAGS[jid] = True
+                j["message"] = "暂停中（当前页 OCR 完成后挂起，进度保留）…"
+            self.send_json({"ok": True})
+            return
+
+        m = re.match(r"^/api/resume/([a-f0-9\-]+)$", p)
+        if m:
+            jid = m.group(1)
+            PAUSE_FLAGS.pop(jid, None)
+            with JOBS_LOCK:
+                j = JOBS.get(jid)
+                if j and j["status"] == "running":
+                    j["message"] = "已恢复，继续处理…"
             self.send_json({"ok": True})
             return
 
@@ -3651,7 +3729,8 @@ class Handler(BaseHTTPRequestHandler):
                 if j["status"] == "running":
                     self.send_json({"error": "任务正在运行"}, 400)
                     return
-                j.update({"status": "queued", "progress": 0, "message": "重新排队"})
+                PAUSE_FLAGS.pop(jid, None)
+                j.update({"status": "queued", "progress": 0, "message": "重新排队（复用已完成的页缓存）"})
                 cfg = dict(j.get("config", {}))
             TASK_QUEUE.put(jid)
             save_jobs()

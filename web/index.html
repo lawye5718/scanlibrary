@@ -384,7 +384,8 @@ function upload(file){
 function note(msg){ console.log(msg); }
 
 function badge(s){
-  const map = {queued:"排队中", running:"转换中", done:"已完成", error:"失败", pending:"等待"};
+  const map = {queued:"排队中", running:"转换中", done:"已完成", error:"失败",
+               pending:"等待", stopped:"已停止", paused:"已暂停"};
   return `<span class="badge ${s}">${map[s]||s}</span>`;
 }
 
@@ -408,7 +409,7 @@ function render(){
       <div class="job" id="job-${j.id}">
         <div class="top">
           <span class="title">${escapeHtml(j.title)}</span>
-          ${badge(j.status)}
+          ${badge(j.paused && j.status==="running" ? "paused" : j.status)}
           <span class="sub" style="color:var(--muted);font-size:12px">${escapeHtml(j.filename||"")}${pages}${chap}${size}</span>
         </div>
         <div class="bar"><i style="width:${pct}%"></i></div>
@@ -422,8 +423,10 @@ function render(){
           ${j.can_proofread && j.status!=="running" && j.status!=="queued"
              ? `<button class="primary" onclick="startProof('${j.id}')">${j.proofread_done?"重新校对":"开始校对"}</button>` : ""}
           ${j.backup_count && j.status!=="running" ? `<button onclick="rollback('${j.id}')">回退到校对前</button>` : ""}
-          ${j.status==="running" ? `<button onclick="cancel('${j.id}')">取消</button>` : ""}
-          ${j.status==="error" ? `<button onclick="retry('${j.id}')">重试（续跑）</button>` : ""}
+          ${j.status==="running" && !j.paused ? `<button onclick="pauseJob('${j.id}')">暂停</button>` : ""}
+          ${j.status==="running" && j.paused ? `<button class="primary" onclick="resumeJob('${j.id}')">恢复</button>` : ""}
+          ${j.status==="running" ? `<button onclick="cancel('${j.id}')">停止</button>` : ""}
+          ${(j.status==="error"||j.status==="stopped") ? `<button onclick="retry('${j.id}')">续跑（断点继续）</button>` : ""}
           <button onclick="toggleLog('${j.id}')">日志</button>
           <button onclick="del('${j.id}')">删除</button>
         </div>
@@ -478,6 +481,8 @@ function dl(id){ const j = jobs.get(id); dlFile("/api/download/"+id, (j?j.title:
 function dlmd(id){ const j = jobs.get(id); dlFile("/api/download-md/"+id, (j?j.title:"book")+".md"); }
 function reveal(id){ api("/api/reveal/"+id).catch(()=>{}); }
 function cancel(id){ api("/api/cancel/"+id).catch(()=>{}); refresh(); }
+function pauseJob(id){ api("/api/pause/"+id).catch(()=>{}); setTimeout(refresh, 300); }
+function resumeJob(id){ api("/api/resume/"+id).catch(()=>{}); setTimeout(refresh, 300); }
 function retry(id){ api("/api/retry/"+id).catch(()=>{}); setTimeout(refresh,300); }
 
 // ---- 单独校对：以成书正文重跑千问校对并重建 EPUB（校对前自动备份）----
