@@ -1035,7 +1035,7 @@ def should_keep_visual_box(label: str, score: float, x1: int, y1: int, x2: int, 
     page_area = max(1, page_w * page_h)
     area_ratio = area / page_area
     min_score = 0.2 if label in PADDLE_FIGURE_LABELS else 0.25
-    if score and score < min_score:
+    if score < min_score:
         return False
     if width < 48 or height < 48:
         return False
