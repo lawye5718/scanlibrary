@@ -686,43 +686,77 @@ def relabel_note_refs(text: str, label_by_id: dict[int, str]) -> str:
 
 def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
     paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
-    out = []
-    recent_norms = []
-    for para in paras:
-        para = re.sub(r"(.{12,260}?)(?:\s*\1){1,}", r"\1", para)
-        norm = re.sub(rf"[^\w{CJK}]+", "", para)
-        if norm and any(prev_norm == norm for prev_norm in recent_norms[-8:]):
-            continue
-        if norm and any(
-            prev_norm.startswith(norm) and len(norm) >= 12 and len(prev_norm) >= 24
-            and (len(norm) / max(1, len(prev_norm)) <= 0.6)
-            for prev_norm in recent_norms[-8:]
-        ):
-            continue
-        if len(norm) >= 80:
-            dup_recent = False
-            for prev_norm in recent_norms[-8:]:
-                if prev_norm == norm:
-                    dup_recent = True
-                    break
-                if prev_norm and difflib.SequenceMatcher(None, prev_norm, norm).ratio() >= 0.985:
-                    dup_recent = True
-                    break
-            if dup_recent:
-                continue
-        if out:
-            prev = out[-1]
-            score = difflib.SequenceMatcher(None, prev, para).ratio()
-            shorter = min(len(prev), len(para))
-            if (shorter >= 20 and score >= similarity) or (shorter >= 40 and (prev in para or para in prev)):
-                continue
-        out.append(para)
-        recent_norms.append(norm)
-    return "\n\n".join(out)
+    kept, _, _ = dedupe_paragraphs_with_history(paras, similarity=similarity)
+    return "\n\n".join(kept)
 
 
 def normalized_text_for_dedup(text: str) -> str:
     return re.sub(rf"[^\w{CJK}]+", "", text or "")
+
+
+def paragraph_is_duplicate(norm: str, recent_norms: list[str], similarity=0.9,
+                           min_len=20, exact_min=6) -> bool:
+    if not norm:
+        return True
+    if len(norm) < exact_min:
+        return norm in recent_norms or bool(re.fullmatch(r"[0-9ivxlcdmIVXLCDM]+", norm))
+    for prev_norm in recent_norms:
+        if not prev_norm:
+            continue
+        if prev_norm == norm:
+            return True
+        shorter = min(len(prev_norm), len(norm))
+        if shorter >= min_len and (prev_norm in norm or norm in prev_norm):
+            return True
+        if shorter >= min_len and difflib.SequenceMatcher(None, prev_norm, norm).ratio() >= similarity:
+            return True
+    return False
+
+
+def dedupe_paragraphs_with_history(paragraphs: list[str], recent_norms=None,
+                                   similarity=0.9, window=12):
+    recent_norms = list(recent_norms or [])
+    kept = []
+    removed = 0
+    for raw in paragraphs:
+        para = re.sub(r"(.{12,260}?)(?:\s*\1){1,}", r"\1", (raw or "").strip())
+        if not para:
+            continue
+        norm = normalized_text_for_dedup(render_note_refs_as_text(para))
+        if paragraph_is_duplicate(norm, recent_norms[-window:], similarity=similarity):
+            removed += 1
+            continue
+        if kept:
+            prev = kept[-1]
+            score = difflib.SequenceMatcher(None, prev, para).ratio()
+            shorter = min(len(prev), len(para))
+            if (shorter >= 20 and score >= similarity) or (shorter >= 40 and (prev in para or para in prev)):
+                removed += 1
+                continue
+        kept.append(para)
+        recent_norms.append(norm)
+    return kept, removed, recent_norms
+
+
+def dedupe_processed_pages(processed: list[dict], similarity=0.9) -> tuple[list[dict], int]:
+    out = []
+    recent_norms = []
+    removed = 0
+    for item in sorted(processed, key=lambda p: int(p.get("page", 0))):
+        if item.get("illustration"):
+            out.append(item)
+            continue
+        paras = [p.strip() for p in re.split(r"\n\s*\n", item.get("text") or "") if p.strip()]
+        kept, rm, recent_norms = dedupe_paragraphs_with_history(
+            paras, recent_norms=recent_norms, similarity=similarity
+        )
+        removed += rm
+        text = "\n\n".join(kept).strip()
+        if text:
+            nxt = dict(item)
+            nxt["text"] = text
+            out.append(nxt)
+    return out, removed
 
 
 def looks_like_duplicate_page(text: str, recent_norms: list[str], similarity=0.99) -> bool:
@@ -830,6 +864,198 @@ def split_chapters_by_pdf_toc(processed: list[dict], toc_chapters: list[dict]) -
         tail = join_processed_pages(pages[cursor:])
         if tail:
             out.append(("正文", tail))
+    return out
+
+
+def _cfg_page_value(value):
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        page = int(value)
+    except Exception:
+        return None
+    return page if page > 0 else None
+
+
+def _cfg_page_span(value):
+    if value in (None, "", [], (), {}):
+        return None
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            page = _cfg_page_value(value[0])
+            return (page, page) if page else None
+        if len(value) >= 2:
+            start = _cfg_page_value(value[0])
+            end = _cfg_page_value(value[1])
+            if start and end:
+                return (min(start, end), max(start, end))
+        return None
+    page = _cfg_page_value(value)
+    return (page, page) if page else None
+
+
+def _page_text_for_chapter(items: list[dict]) -> str:
+    return collapse_repeated_paragraphs(merge_wrapped_lines(join_processed_pages(items)))
+
+
+def page_text_ends_cleanly(text: str) -> bool:
+    if not (text or "").strip():
+        return True
+    paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    if not paras:
+        return True
+    tail = paras[-1]
+    if IMAGE_MARKER_RE.match(tail):
+        return True
+    return tail[-1:] in "。！？；：”』」》…!?;:）)"
+
+
+TOC_LINE_RE = re.compile(r"^(?P<title>.+?)(?:\s*[·•●•‧・.\-_…⋯]{2,}\s*|\s{2,})(?P<page>[0-9]{1,4})\s*$")
+
+
+def extract_toc_entries_from_text(text: str) -> list[tuple[str, int]]:
+    entries = []
+    pending = ""
+    for raw in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if not line:
+            continue
+        if re.fullmatch(r"(?:目\s*录|目录|contents?)", line, re.I):
+            pending = ""
+            continue
+        probe = (pending + " " + line).strip() if pending else line
+        m = TOC_LINE_RE.match(probe)
+        if m:
+            title = normalize_pdf_chapter_title(m.group("title"))
+            page = int(m.group("page"))
+            if title and page > 0:
+                entries.append((title, page))
+            pending = ""
+            continue
+        pending = line if len(line) <= 40 else ""
+    return entries
+
+
+def map_toc_page_to_actual(page_no: int, body_pages: list[int]) -> int | None:
+    if not body_pages or page_no <= 0:
+        return None
+    if page_no in body_pages:
+        return page_no
+    logical = body_pages[0] + page_no - 1
+    if logical in body_pages:
+        return logical
+    if logical < body_pages[0] or logical > body_pages[-1]:
+        return None
+    idx = bisect.bisect_left(body_pages, logical)
+    return body_pages[idx] if idx < len(body_pages) else None
+
+
+def build_toc_chapters_from_pages(processed: list[dict], toc_span, body_pages: list[int]) -> list[dict]:
+    if not toc_span or not body_pages:
+        return []
+    left, right = toc_span
+    toc_items = [p for p in processed if left <= int(p.get("page", 0)) <= right]
+    toc_text = "\n".join((item.get("text") or "") for item in toc_items)
+    entries = extract_toc_entries_from_text(toc_text)
+    if not entries:
+        return []
+    mapped = []
+    seen_pages = set()
+    last_page = 0
+    for title, page_no in entries:
+        actual = map_toc_page_to_actual(page_no, body_pages)
+        if actual is None or actual <= last_page or actual in seen_pages:
+            continue
+        mapped.append({"title": title, "start_page": actual})
+        seen_pages.add(actual)
+        last_page = actual
+    for idx, item in enumerate(mapped):
+        item["end_page"] = (mapped[idx + 1]["start_page"] - 1) if idx + 1 < len(mapped) else body_pages[-1]
+    return mapped
+
+
+def split_body_by_fixed_page_chunks(processed: list[dict], pages_per_chapter=20, max_extra_pages=6) -> list[tuple[str, str]]:
+    pages = [p for p in sorted(processed, key=lambda x: int(x.get("page", 0))) if (p.get("text") or "").strip()]
+    if not pages:
+        return []
+    pages_per_chapter = max(1, int(pages_per_chapter or 20))
+    out = []
+    cursor = 0
+    chapter_no = 1
+    while cursor < len(pages):
+        end = min(len(pages) - 1, cursor + pages_per_chapter - 1)
+        while end + 1 < len(pages) and (end - cursor + 1) < pages_per_chapter + max_extra_pages:
+            next_first = ((pages[end + 1].get("text") or "").strip().split("\n", 1)[0].strip())
+            if is_chapter_line(next_first) or page_text_ends_cleanly(pages[end].get("text") or ""):
+                break
+            end += 1
+        body = _page_text_for_chapter(pages[cursor:end + 1])
+        if body:
+            out.append((f"第{chapter_no}章", body))
+            chapter_no += 1
+        cursor = end + 1
+    return out
+
+
+def has_manual_chapter_config(cfg: dict) -> bool:
+    keys = {
+        "cover_page", "back_cover_page", "title_page", "copyright_page",
+        "toc_page_range", "preface_page_range", "chapter_method", "chapter_target_pages",
+    }
+    return any(k in (cfg or {}) for k in keys)
+
+
+def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: list[dict]) -> list[tuple[str, str]]:
+    pages_by_no = {int(item.get("page", 0)): item for item in processed if int(item.get("page", 0)) > 0}
+    if not pages_by_no:
+        return []
+    ordered_pages = sorted(pages_by_no)
+    assigned = set()
+    front_sections = []
+
+    def add_single(key, title):
+        page = _cfg_page_value((cfg or {}).get(key))
+        if page in pages_by_no and page not in assigned:
+            assigned.add(page)
+            front_sections.append((title, [page]))
+
+    def add_span(key, title):
+        span = _cfg_page_span((cfg or {}).get(key))
+        if not span:
+            return
+        left, right = span
+        selected = [p for p in ordered_pages if left <= p <= right and p not in assigned]
+        if selected:
+            assigned.update(selected)
+            front_sections.append((title, selected))
+
+    add_single("cover_page", "封面")
+    add_single("back_cover_page", "封底")
+    add_single("title_page", "扉页")
+    add_single("copyright_page", "版权页")
+    add_span("toc_page_range", "目录")
+    add_span("preface_page_range", "序言")
+
+    out = []
+    for title, page_nums in front_sections:
+        body = _page_text_for_chapter([pages_by_no[p] for p in page_nums])
+        if body:
+            out.append((title, body))
+
+    body_processed = [pages_by_no[p] for p in ordered_pages if p not in assigned]
+    body_page_nums = [int(item.get("page", 0)) for item in body_processed]
+    if not body_processed:
+        return out
+
+    method = str((cfg or {}).get("chapter_method") or "toc").strip().lower()
+    toc_chapters = build_toc_chapters_from_pages(processed, _cfg_page_span((cfg or {}).get("toc_page_range")), body_page_nums)
+    if not toc_chapters and pdf_toc_chapters:
+        toc_chapters = pdf_toc_chapters
+    if method == "toc" and toc_chapters:
+        out.extend(split_chapters_by_pdf_toc(body_processed, toc_chapters))
+        return out
+    pages_per_chapter = int((cfg or {}).get("chapter_target_pages") or 20)
+    out.extend(split_body_by_fixed_page_chunks(body_processed, pages_per_chapter=pages_per_chapter))
     return out
 
 
@@ -1468,8 +1694,7 @@ CHAPTER_PATTERNS = [
     r"^#+\s+.*$",
     r"^第\s*[0-9一二三四五六七八九十百千零〇]+\s*[章节篇回卷部集]\s*.*$",
     r"^(?:CHAPTER|Chapter)\s+[0-9IVXLC]+\s*.*$",
-    r"^[0-9]{1,3}\s*[、.\s]\s*\S.*$",
-    r"^序(?:言|章)?|^前言|^后记|^附录|^引子|^楔子|^尾声$",
+    r"^(?:序(?:言|章)?|前言|后记|附录|引子|楔子|尾声)$",
 ]
 
 
@@ -2382,12 +2607,21 @@ def run_job(job_id):
                 recent_page_norms.append(normalized_text_for_dedup(body_text))
             if notes:
                 all_notes.extend(notes)
-        raw_toc_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters) if pdf_toc_chapters else []
+        processed, dedup_removed = dedupe_processed_pages(processed)
+        if dedup_removed:
+            log(job_id, f"跨页去重删除 {dedup_removed} 段重复正文")
+        structured_chapters = []
+        if has_manual_chapter_config(cfg):
+            structured_chapters = build_manual_chapters(processed, cfg, pdf_toc_chapters)
+            if structured_chapters:
+                log(job_id, f"按人工分页规则生成 {len(structured_chapters)} 个章节/前置部分")
+        elif pdf_toc_chapters:
+            structured_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters)
         normalized_toc_chapters = []
-        if raw_toc_chapters:
+        if structured_chapters:
             normalized_toc_chapters = [
                 (normalize_pdf_chapter_title(title) or "正文", collapse_repeated_paragraphs(merge_wrapped_lines(body)))
-                for title, body in raw_toc_chapters
+                for title, body in structured_chapters
                 if (body or "").strip()
             ]
             normalized_toc_chapters = [
