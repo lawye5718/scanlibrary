@@ -1207,7 +1207,7 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                         backref_html = f'<a class="backref" aria-label="返回本章开头" href="#chapter-{i + 1}">返回本章</a>'
                     note_lines.append(
                         f'<p id="note-{note["id"]}" epub:type="endnote"><strong>{label}</strong> {text}'
-                        f'{backref_html}</p>'
+                        f' {backref_html}</p>'
                     )
                 note_lines.append("</section>")
                 note_html = "\n".join(note_lines)
@@ -1505,6 +1505,14 @@ def run_job(job_id):
                     "notes": chapter_notes,
                     "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
                 })
+        if not chapters:
+            chapter_notes = collect_note_refs_for_epub(full, all_notes)
+            chapters = [{
+                "title": "正文",
+                "body": full,
+                "notes": chapter_notes,
+                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
+            }]
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
@@ -1758,7 +1766,6 @@ class Handler(BaseHTTPRequestHandler):
                     cfg = json.loads(base64.b64decode(cfg_raw))
             except Exception:
                 cfg = {}
-            cfg.setdefault("backend", "paddle-layout")
             if cfg.get("proofread") and not (cfg.get("proof_model") or "").strip():
                 cfg["proof_model"] = "qwen14b-pro"
             job_id = str(uuid.uuid4())
