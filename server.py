@@ -993,7 +993,6 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             note_lines += ['</body>', '</html>', '']
             z.writestr("OEBPS/notes.xhtml", "\n".join(note_lines))
             manifest.append('    <item id="notes" href="notes.xhtml" media-type="application/xhtml+xml"/>')
-            spine.append('    <itemref idref="notes"/>')
             nav_items.append(("注释", "notes.xhtml"))
 
         nav = ['<?xml version="1.0" encoding="UTF-8"?>',
