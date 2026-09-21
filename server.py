@@ -947,7 +947,8 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                     continue
                 mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
                 z.writestr(f"OEBPS/images/{asset.name}", asset.read_bytes())
-                manifest.append(f'    <item id="asset-{asset.stem}" href="images/{asset.name}" media-type="{mime}"/>')
+                asset_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", asset.name)
+                manifest.append(f'    <item id="asset-{asset_id}" href="images/{asset.name}" media-type="{mime}"/>')
 
         for i, chapter in enumerate(chapters):
             ctitle = chapter["title"]
@@ -1258,7 +1259,11 @@ def run_job(job_id):
             body_with_refs, chapter_notes = note_refs_for_epub(full, all_notes)
             for note in chapter_notes:
                 note["chapter_href"] = "chap_0001.xhtml"
-            chapters = [{"title": "正文", "body": body_with_refs, "illustration_only": False}]
+            chapters = [{
+                "title": "正文",
+                "body": body_with_refs,
+                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
+            }]
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
