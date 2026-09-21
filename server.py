@@ -1466,6 +1466,8 @@ PROOF_CHUNK_CHARS = 700       # 每块目标字数（500~800 之间对本地模�
 PROOF_MIN_RATIO = 0.95        # 校对后长度 < 原文 95% → 判定偷懒省略
 PROOF_MAX_RATIO = 1.05        # 校对后长度 > 原文 105% → 判定幻觉扩写
 PROOF_MIN_SIMILARITY = 0.90   # 与原文相似度下限 → 判定改写润色
+PROOF_RETRY_SPLIT_ON_FAIL = True   # 不合格块自动对半切开重试一次（仅一次）
+PROOF_RETRY_MIN_CHARS = 240        # 小块不拆分，避免无意义重试
 
 PROOFREAD_SYSTEM_PROMPT = """你是一个极其严谨的 OCR 文本校对员。你的唯一任务是修正 OCR 扫描产生的错别字、漏字、多余符号和标点错误，必须 100% 忠实于原文。
 
@@ -1563,6 +1565,54 @@ def _proof_norm(s: str) -> str:
     return re.sub(r"\s+", "", s or "")
 
 
+def parse_bool(v, default=False):
+    """宽松布尔解析：支持 bool/int/字符串。"""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on", "y"):
+        return True
+    if s in ("0", "false", "no", "off", "n"):
+        return False
+    return default
+
+
+def parse_int(v, default):
+    """宽松整数解析：失败时回退默认值。"""
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def split_failed_chunk_once(text: str, min_chars: int = PROOF_RETRY_MIN_CHARS):
+    """不合格块一次性对半切开，返回 (left, right)；切分点保留原始边界字符。"""
+    if not text:
+        return None
+    if len(text) < max(1, int(min_chars)):
+        return None
+
+    mid = len(text) // 2
+    cuts = []
+    for m in re.finditer(r"\n\s*\n+", text):
+        cuts.append(m.end())
+    for m in re.finditer(r"[。！？；!?;]\s*", text):
+        cuts.append(m.end())
+    cuts = [c for c in cuts if 1 <= c < len(text)]
+    if cuts:
+        split_at = min(cuts, key=lambda c: abs(c - mid))
+    else:
+        split_at = mid
+    left, right = text[:split_at], text[split_at:]
+    if not left.strip() or not right.strip():
+        return None
+    return left, right
+
+
 def proofread_chunk_guard(orig: str, fixed: str, low=None, high=None, sim_min=None):
     """兜底校验：长度偏差过大或相似度过低 → 判定模型偷懒/幻觉。
 
@@ -1606,24 +1656,28 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
     low = float(cfg.get("proof_len_ratio_low", PROOF_MIN_RATIO))
     high = float(cfg.get("proof_len_ratio_high", PROOF_MAX_RATIO))
     sim_min = float(cfg.get("proof_similarity_min", PROOF_MIN_SIMILARITY))
+    retry_split_on_fail = parse_bool(
+        cfg.get("proof_retry_split_on_fail", PROOF_RETRY_SPLIT_ON_FAIL),
+        PROOF_RETRY_SPLIT_ON_FAIL
+    )
+    retry_min_chars = parse_int(cfg.get("proof_retry_min_chars", PROOF_RETRY_MIN_CHARS),
+                                PROOF_RETRY_MIN_CHARS)
     chunks = split_for_proofread(text, chunk_chars)
     total = len(chunks)
     log_fn(job_id, f"校对分块 {total} 块（约 {chunk_chars} 字/块，temperature=0.0、"
                    f"top_p=0.1，逐块做长度/相似度兜底）")
     out, n_ok, n_fallback, n_changed = [], 0, 0, 0
 
-    def _rec(status, reason, fixed):
+    def _rec(status, reason, fixed, orig, idx):
         """逐块记录结果，供「校对对照表」人工确认。"""
         if records is None:
             return
-        records.append({"i": i + 1, "total": total, "status": status,
-                        "reason": reason, "orig": c, "fixed": fixed,
-                        "changed": status == "ok" and _proof_norm(fixed) != _proof_norm(c)})
+        records.append({"i": idx, "total": total, "status": status,
+                        "reason": reason, "orig": orig, "fixed": fixed,
+                        "changed": status == "ok" and _proof_norm(fixed) != _proof_norm(orig)})
 
-    for i, c in enumerate(chunks):
-        if CANCEL_FLAGS.get(job_id):
-            raise RuntimeError("已取消")
-        protected, saved = protect_note_refs(c)
+    def _run_one(orig, idx, parent_idx, parent_total):
+        protected, saved = protect_note_refs(orig)
         messages = [
             {"role": "system", "content": PROOFREAD_SYSTEM_PROMPT},
             {"role": "user", "content": PROOFREAD_USER_TEMPLATE.format(chunk=protected)},
@@ -1640,36 +1694,66 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
                 timeout=int(cfg.get("proof_timeout", 900)), keep_alive="30m",
             )
         except Exception as e:  # noqa
-            log_fn(job_id, f"第 {i + 1}/{total} 块请求失败，保留原文：{e}")
-            _rec("fallback", f"请求失败：{e}", c)
-            out.append(c)
-            n_fallback += 1
-            if progress_cb:
-                progress_cb(i + 1, total)
-            continue
+            log_fn(job_id, f"第 {idx} 块（父块 {parent_idx}/{parent_total}）请求失败，保留原文：{e}")
+            return False, orig, f"请求失败：{e}"
 
         restored, expected, got = restore_note_refs(raw, saved)
         if expected and got < expected:
-            log_fn(job_id, f"第 {i + 1}/{total} 块丢失引注标记（{got}/{expected}），保留原文")
-            _rec("fallback", f"丢失引注标记（{got}/{expected}）", c)
-            out.append(c)
-            n_fallback += 1
-            if progress_cb:
-                progress_cb(i + 1, total)
-            continue
+            msg = f"丢失引注标记（{got}/{expected}）"
+            log_fn(job_id, f"第 {idx} 块（父块 {parent_idx}/{parent_total}）{msg}，保留原文")
+            return False, orig, msg
 
-        ok, why = proofread_chunk_guard(c, restored, low, high, sim_min)
+        ok, why = proofread_chunk_guard(orig, restored, low, high, sim_min)
         if not ok:
-            log_fn(job_id, f"第 {i + 1}/{total} 块判为不合格（{why}），保留原文")
-            _rec("fallback", why, c)
-            out.append(c)
-            n_fallback += 1
-        else:
-            if _proof_norm(restored) != _proof_norm(c):
+            log_fn(job_id, f"第 {idx} 块（父块 {parent_idx}/{parent_total}）判为不合格（{why}），保留原文")
+            return False, orig, why
+        return True, restored, ""
+
+    for i, c in enumerate(chunks):
+        if CANCEL_FLAGS.get(job_id):
+            raise RuntimeError("已取消")
+        parent_idx = i + 1
+        parent_label = f"{parent_idx}"
+        ok, fixed, why = _run_one(c, parent_label, parent_idx, total)
+        if ok:
+            if _proof_norm(fixed) != _proof_norm(c):
                 n_changed += 1
-            _rec("ok", "", restored)
-            out.append(restored)
+            _rec("ok", "", fixed, c, parent_label)
+            out.append(fixed)
             n_ok += 1
+        else:
+            split_pair = split_failed_chunk_once(c, retry_min_chars) if retry_split_on_fail else None
+            subs = list(split_pair) if split_pair else []
+            if subs:
+                log_fn(job_id, f"第 {parent_idx}/{total} 块未通过（{why}），对半切开重试一次")
+                sub_results = []
+                for k, sub in enumerate(subs):
+                    if CANCEL_FLAGS.get(job_id):
+                        raise RuntimeError("已取消")
+                    sub_label = f"{parent_idx}.{k + 1}"
+                    sub_ok, sub_fixed, sub_why = _run_one(sub, sub_label, parent_idx, total)
+                    sub_changed = sub_ok and _proof_norm(sub_fixed) != _proof_norm(sub)
+                    sub_results.append({
+                        "ok": sub_ok, "fixed": sub_fixed, "orig": sub,
+                        "idx": sub_label, "why": sub_why, "changed": sub_changed,
+                    })
+                parent_all_ok = all(x["ok"] for x in sub_results)
+                if parent_all_ok:
+                    for r in sub_results:
+                        _rec("ok", "", r["fixed"], r["orig"], r["idx"])
+                    out.append("".join(r["fixed"] for r in sub_results))
+                    n_ok += 1
+                    if any(r["changed"] for r in sub_results):
+                        n_changed += 1
+                else:
+                    fail_reasons = [r["why"] for r in sub_results if not r["ok"]]
+                    _rec("fallback", f"{'；'.join(fail_reasons)}（拆分重试后）", c, c, parent_label)
+                    n_fallback += 1
+                    out.append(c)
+            else:
+                _rec("fallback", why, c, c, parent_label)
+                out.append(c)
+                n_fallback += 1
         if (i + 1) % 10 == 0:
             log_fn(job_id, f"校对进度 {i + 1}/{total} 块（通过 {n_ok}，回退 {n_fallback}）")
         if progress_cb:
@@ -2595,7 +2679,8 @@ class Handler(BaseHTTPRequestHandler):
                     cfg["proof_model"] = "qwen14b-pro"
                 for k in ("proof_chunk_chars", "proof_len_ratio_low",
                           "proof_len_ratio_high", "proof_similarity_min",
-                          "proof_num_ctx", "proof_timeout"):
+                          "proof_num_ctx", "proof_timeout",
+                          "proof_retry_split_on_fail", "proof_retry_min_chars"):
                     if body.get(k) not in (None, ""):
                         cfg[k] = body[k]
                 j["config"] = cfg
