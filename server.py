@@ -508,22 +508,27 @@ def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
         if m and idx >= half and len(para) <= 600:
             label = m.group(1).strip()
             note_text = para[m.end():].strip() or para.strip()
-            note = {"id": next_note_id, "label": label, "text": note_text, "page": page_no}
-            notes.append(note)
-            next_note_id += 1
-        else:
-            body.append(para)
-    body_text = "\n\n".join(body).strip()
-    for note in notes:
-        label_pat = rf"(?<![A-Za-z0-9]){re.escape(note['label'])}(?![A-Za-z0-9])"
-        body_text, n = re.subn(
-            label_pat,
-            f"[[NOTE_REF:{note['id']}|{note['label']}]]",
-            body_text,
-            count=1,
-        )
-        note["linked"] = bool(n)
-    return body_text, notes, next_note_id
+            label_pat = rf"(?<![A-Za-z0-9]){re.escape(label)}(?![A-Za-z0-9])"
+            body_text = "\n\n".join(body).strip()
+            linked_text, n = re.subn(
+                label_pat,
+                f"[[NOTE_REF:{next_note_id}|{label}]]",
+                body_text,
+                count=1,
+            )
+            if n:
+                body = [linked_text] if linked_text else []
+                notes.append({
+                    "id": next_note_id,
+                    "label": label,
+                    "text": note_text,
+                    "page": page_no,
+                    "linked": True,
+                })
+                next_note_id += 1
+                continue
+        body.append(para)
+    return "\n\n".join(body).strip(), notes, next_note_id
 
 
 def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
@@ -788,7 +793,7 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
             fig_path = img_path.parent / f"{base_stem}.jpg"
             try:
                 crop.save(fig_path, "JPEG", quality=85)
-                parts.append((y1, x1, f"![插图]({fig_path.name})"))
+                parts.append((y1, x1, image_marker_md(fig_path, "插图")))
             except Exception:
                 pass
             continue
@@ -796,7 +801,7 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
             asset_path = img_path.parent / f"{base_stem}_{label}.jpg"
             try:
                 crop.save(asset_path, "JPEG", quality=90)
-                parts.append((y1, x1, f"![{label}]({asset_path.name})"))
+                parts.append((y1, x1, image_marker_md(asset_path, label)))
             except Exception:
                 pass
             continue
