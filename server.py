@@ -414,21 +414,23 @@ def split_image_halves(img_path: Path) -> list[Path]:
     """把顽固页面裁成上下两半，降低视觉上下文复杂度。"""
     fitz = _pymupdf()
     doc = fitz.open(str(img_path))
-    page = doc[0]
-    rect = page.rect
-    mid = rect.y0 + rect.height / 2
-    clips = [
-        ("top", fitz.Rect(rect.x0, rect.y0, rect.x1, mid)),
-        ("bottom", fitz.Rect(rect.x0, mid, rect.x1, rect.y1)),
-    ]
-    parts = []
-    for suffix, clip in clips:
-        out = img_path.with_suffix(f".{suffix}.jpg")
-        pix = page.get_pixmap(clip=clip, alpha=False)
-        pix.save(str(out), jpg_quality=85)
-        parts.append(out)
-    doc.close()
-    return parts
+    try:
+        page = doc[0]
+        rect = page.rect
+        mid = rect.y0 + rect.height / 2
+        clips = [
+            ("top", fitz.Rect(rect.x0, rect.y0, rect.x1, mid)),
+            ("bottom", fitz.Rect(rect.x0, mid, rect.x1, rect.y1)),
+        ]
+        parts = []
+        for suffix, clip in clips:
+            out = img_path.with_suffix(f".{suffix}.jpg")
+            pix = page.get_pixmap(clip=clip, alpha=False)
+            pix.save(str(out), jpg_quality=85)
+            parts.append(out)
+        return parts
+    finally:
+        doc.close()
 
 
 def is_suspicious_ocr_text(text: str) -> bool:
@@ -980,7 +982,8 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                 chapter_href = html.escape(note.get("chapter_href", "nav.xhtml"))
                 note_lines.append(
                     f'<p id="note-{note["id"]}"><strong>{label}</strong> {text}'
-                    f'<a class="backref" href="{chapter_href}#note-ref-{note["id"]}">↩</a></p>'
+                    f'<a class="backref" aria-label="返回正文中的注释引用" '
+                    f'href="{chapter_href}#note-ref-{note["id"]}">返回正文</a></p>'
                 )
             note_lines += ['</body>', '</html>', '']
             z.writestr("OEBPS/notes.xhtml", "\n".join(note_lines))
@@ -1245,7 +1248,7 @@ def run_job(job_id):
             idx = len(chapters) + 1
             fname = f"chap_{idx:04d}.xhtml"
             for note in chapter_notes:
-                note.setdefault("chapter_href", fname)
+                note["chapter_href"] = fname
             chapters.append({
                 "title": title0,
                 "body": body_with_refs,
@@ -1254,7 +1257,7 @@ def run_job(job_id):
         if not chapters:
             body_with_refs, chapter_notes = note_refs_for_epub(full, all_notes)
             for note in chapter_notes:
-                note.setdefault("chapter_href", "chap_0001.xhtml")
+                note["chapter_href"] = "chap_0001.xhtml"
             chapters = [{"title": "正文", "body": body_with_refs, "illustration_only": False}]
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
