@@ -95,6 +95,97 @@ assert "禁止润色" in server.PROOFREAD_SYSTEM_PROMPT
 assert "测试块" in server.PROOFREAD_USER_TEMPLATE.format(chunk="测试块")
 print("✅ 校对引擎单测通过（分块守恒/引注保护/兜底判定/失败块对半重试/低温参数）")
 
+# ==================== 结构页识别 / 段首去重 / 真实目录页 OCR ====================
+# 1) 段首字符递归比对去重（用户算法）
+assert server.shared_prefix_len("正文重复开头ABCDE", "正文重复开头XYZ") == 6  # 共享"正文重复开头"6字
+assert server.shared_prefix_len("甲乙", "甲乙") == 2
+_page = "春天来了万物复苏鸟语花香柳树发芽。\n\n春天来了万物复苏鸟语花香桃花也开了。\n\n另一段完全不同的内容保持原样。"
+_deduped, _trim, _rm = server.dedupe_page_paragraph_prefixes(_page)
+assert _trim == 1 and _rm == 0, (_trim, _rm)
+assert "桃花也开了" in _deduped and _deduped.count("春天来了万物复苏鸟语花香") == 1
+# 整段被前段包含 → 后段整段删除
+_full_dup = "这一段是完全重复的内容出现两次。\n\n这一段是完全重复的内容出现两次。"
+_d2, _t2, _r2 = server.dedupe_page_paragraph_prefixes(_full_dup)
+assert _r2 == 1 and _d2.count("完全重复") == 1
+# 共有前缀 ≤4 字（正常段落开头相似）→ 不动
+_ok_page = "第一章开篇。\n\n第一章正文从这里开始。"
+_d3, _t3, _r3 = server.dedupe_page_paragraph_prefixes(_ok_page)
+assert _t3 == 0 and _r3 == 0 and _d3 == _ok_page
+# 多轮递归：第一轮删共同前缀，第二轮再互检出新增的前缀重复
+_rounds = "起始段落内容一。\n\n起始段落内容一起始段落后续。\n\n起始段落内容一起始段落后续再重复一次。"
+_d4, _t4, _r4 = server.dedupe_page_paragraph_prefixes(_rounds)
+assert _d4 == "起始段落内容一。\n\n起始段落后续。\n\n再重复一次。", repr(_d4)
+assert _d4.count("起始段落内容一。") == 1
+
+# 2) 自动结构页识别（封面/封底/扉页/版权/目录/正文）
+assert server.classify_page_type("约翰逊博士传", 1, 10, pos=0) == "cover"
+assert server.classify_page_type(
+    "图书在版编目（CIP）数据\n书号 ISBN 978-7-02-015894-5\n出版发行：人民文学出版社\n印次：2023年第1次印刷", 5, 10, pos=3) == "copyright"
+assert server.classify_page_type(
+    "目 录\n第一章 早年生活…1\n第二章 牛津岁月…24\n第三章 伦敦初到…52\n第四章 文坛成名…80\n第五章 晚年岁月…130", 6, 10, pos=4) == "toc"
+assert server.classify_page_type("本书完\n感谢阅读", 10, 10, pos=9) == "back_cover"
+assert server.classify_page_type("约翰逊博士传\n（英）詹姆斯·鲍斯威尔 著", 3, 40, pos=2) == "title_page"
+assert server.classify_page_type("正文第一段内容详细叙述着故事情节的发展变化。" * 5, 9, 40, pos=6) is None
+_proc = [
+    {"page": 1, "text": "约翰逊博士传", "illustration": False},
+    {"page": 2, "text": "约翰逊博士传\n（英）詹姆斯·鲍斯威尔 著", "illustration": False},
+    {"page": 3, "text": "书号 ISBN 978-7-02-015894-5\n出版发行：人民文学出版社\n版权所有 翻版必究", "illustration": False},
+    {"page": 4, "text": "目 录\n第一章 早年生活…1\n第二章 牛津岁月…24\n第三章 伦敦初到…52\n第四章 文坛成名…80\n第五章 晚年岁月…130", "illustration": False},
+    {"page": 5, "text": "第一章 早年生活\n\n正文内容开始叙述童年的经历与成长环境。", "illustration": False},
+    {"page": 6, "text": "正文继续展开叙述更多细节内容以充实故事情节发展。", "illustration": False},
+]
+_auto = server.auto_classify_pages(_proc)
+assert _auto["cover"] == [1], _auto
+assert _auto["title_page"] == [2], _auto
+assert _auto["copyright"] == [3], _auto
+assert _auto["toc"] == [4], _auto
+_desc = server.describe_auto_pages(_auto)
+assert "封面=1" in _desc and "目录=4" in _desc
+
+# 3) 更贴近真实的目录页 OCR 回归（点线/空格/页码/噪声混合）
+_real_toc = """目 录
+第一章早年生活……………………1
+第二章牛津岁月…………………24
+第三章伦敦初到 52
+第四章文坛成名 · · · · · · · · 80
+第五章晚年岁月……130
+第六章书信往来          168
+一个不太像目录的普通段落，没有页码结尾。
+第七章附录资料………201"""
+_entries = server.extract_toc_entries_from_text(_real_toc)
+_titles = [t for t, _p in _entries]
+assert len(_entries) == 7, _entries
+assert _titles[0] == "第一章早年生活" and _entries[0][1] == 1
+assert _entries[2] == ("第三章伦敦初到", 52)
+assert _entries[4] == ("第五章晚年岁月", 130)
+assert _entries[6] == ("第七章附录资料", 201)
+assert all("普通段落" not in t for t in _titles)
+_toc_kind = server.classify_page_type(_real_toc, 4, 10, pos=3)
+assert _toc_kind == "toc", _toc_kind
+
+# 4) 推荐默认参数：键完整、可补缺、不覆盖人工值
+_missing = {"dpi": None, "proof_model": ""}
+_filled = server.apply_recommended_defaults(dict(server.RECOMMENDED_DEFAULTS, **_missing))
+assert _filled["dpi"] == 200 and _filled["proof_model"] == "qwen14b-pro"
+_manual = server.apply_recommended_defaults({"dpi": 300, "proofread": True})
+assert _manual["dpi"] == 300 and "mode" not in _manual  # 人工值不动，流程分支键不自动填
+assert server.RECOMMENDED_DEFAULTS["prefix_dedupe_min_shared"] == 5
+assert set(server._RECOMMENDED_SAFE_KEYS) <= set(server.RECOMMENDED_DEFAULTS)
+
+# 5) 人工分章 + 自动识别并行：留空字段回退自动识别
+_ch = server.build_manual_chapters(_proc, {"chapter_config_enabled": True, "chapter_method": "toc"},
+                                    pdf_toc_chapters=[], auto_pages=_auto)
+_ch_titles = [t for t, _b in _ch]
+assert "封面" in _ch_titles and "扉页" in _ch_titles and "版权页" in _ch_titles and "目录" in _ch_titles, _ch_titles
+# 人工覆盖：指定封面为第 2 页，自动值被忽略
+_ch2 = server.build_manual_chapters(_proc, {"chapter_config_enabled": True, "cover_page": 2,
+                                            "chapter_method": "toc"},
+                                    pdf_toc_chapters=[], auto_pages=_auto)
+_cover_body = [b for t, b in _ch2 if t == "封面"]
+assert _cover_body and "鲍斯威尔" in _cover_body[0], _cover_body
+print("✅ 结构页识别/段首去重/真实目录页OCR/默认参数 单测通过")
+
+
 srv = server.Server(("127.0.0.1", 8801), server.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 time.sleep(0.5)

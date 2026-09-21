@@ -78,6 +78,57 @@ PASSWORD = [None]           # 当前密码（--password 或 auth.json）
 OCR_FAIL_TAG = "【OCR-FAILED】"  # 失败页缓存标记：重跑时识别并重新 OCR
 NO_TEXT_TOKEN = "〔无文字〕"
 
+# ---- 推荐默认参数（适合大多数扫描书）----
+# 面向"扫描版中文书 → 可重排 EPUB"场景梳理的一套开箱即用参数。
+# 依据本项目真实跑过的书（400 页传记、图注密排书、试读样本）调优而来：
+#   * DPI 200：印刷字清晰、PDF 每页约 0.4~0.5MB，OCR 速度与精度平衡最好；
+#     300 只在原书字号极小（如缩印古籍）时才值得开。
+#   * 并发 1：glm-ocr 类 7B 级模型已吃满 GPU，加并发只会互相拖慢；
+#     若换 paddle-layout 前端 + 独立 glm-ocr 后端可尝试 2。
+#   * 校对块 700 字：本地 qwen 14B 级模型的长文稳定性甜点（500~800）。
+#   * 跨页去重相似度 0.90：经验值，0.95 漏掉重复、0.85 误伤正常段。
+#   * 段首前缀去重阈值 >4 字：中文段落自然共有前缀很少超过 4 字，
+#     超过即基本可判定为 OCR 重复段。
+RECOMMENDED_DEFAULTS = {
+    "dpi": 200,                      # 页面渲染 DPI（150~300；字小再升）
+    "concurrency": 1,                # OCR 并发（本地大模型默认 1）
+    "mode": "test",                  # 首跑建议试读（前 10 页）验证流程
+    "backend": "glm-ocr",            # OCR 后端（glm-ocr / paddle-layout / mineru）
+    "force_reocr": False,            # 复用分页缓存，只在识别质量差时勾
+    "auto_page_classify": True,      # 自动识别封面/封底/扉页/版权/目录页
+    "chapter_method": "toc",         # 正文分章：优先按目录页
+    "chapter_target_pages": 20,      # 目录不可用时按页数截章的目标值
+    "proofread": False,              # 先出 EPUB 再单独校对（推荐节奏）
+    "proof_model": "qwen14b-pro",    # 校对模型
+    "proof_chunk_chars": 700,        # 校对分块字数（500~800 稳）
+    "proof_similarity_min": 0.90,    # 校对块与原文相似度下限
+    "proof_len_ratio_low": 0.95,     # 长度下限（防偷懒省略）
+    "proof_len_ratio_high": 1.05,    # 长度上限（防幻觉扩写）
+    "proof_retry_split_on_fail": True,  # 失败块对半切开重试一次
+    "proof_retry_min_chars": 240,   # 小于该字数的失败块不再拆
+    "dedupe_similarity": 0.90,      # 跨页段落去重相似度阈值
+    "prefix_dedupe_min_shared": 5,  # 段首前缀重复字数阈值（>4 触发）
+}
+
+
+# 这些键可以安全地按推荐值补缺（mode/proofread 等涉及流程分支的不自动填）
+_RECOMMENDED_SAFE_KEYS = (
+    "dpi", "concurrency", "backend", "force_reocr", "auto_page_classify",
+    "chapter_method", "chapter_target_pages", "proof_model", "proof_chunk_chars",
+    "proof_similarity_min", "proof_len_ratio_low", "proof_len_ratio_high",
+    "proof_retry_split_on_fail", "proof_retry_min_chars",
+    "dedupe_similarity", "prefix_dedupe_min_shared",
+)
+
+
+def apply_recommended_defaults(cfg: dict) -> dict:
+    """把推荐默认参数填进缺失的配置项；人工已填的值一律不动。"""
+    for key in _RECOMMENDED_SAFE_KEYS:
+        if (cfg or {}).get(key) in (None, "") and key in RECOMMENDED_DEFAULTS:
+            cfg[key] = RECOMMENDED_DEFAULTS[key]
+    return cfg
+
+
 # ---- PP-DocLayout_plus-L 类别映射（仅 paddle-layout 后端使用）----
 # 丢弃：规则化移除，永远不进正文
 PADDLE_DROP_LABELS = frozenset({"header", "footer", "page_number", "seal"})
@@ -738,7 +789,69 @@ def dedupe_paragraphs_with_history(paragraphs: list[str], recent_norms=None,
     return kept, removed, recent_norms
 
 
-def dedupe_processed_pages(processed: list[dict], similarity=0.9) -> tuple[list[dict], int]:
+def shared_prefix_len(a: str, b: str) -> int:
+    """逐字比对两段开头，返回最长相同前缀的字符数。"""
+    n = 0
+    for x, y in zip(a or "", b or ""):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+# 段首递归比对去重：两段前缀重复字数 > 4（即 ≥ PREFIX_DEDUPE_MIN_SHARED）才动刀
+PREFIX_DEDUPE_MIN_SHARED = 5
+PREFIX_DEDUPE_MAX_ROUNDS = 8
+
+
+def dedupe_prefix_in_paragraphs(paras: list[str], min_shared: int = PREFIX_DEDUPE_MIN_SHARED):
+    """页内段落间按首字递归比对去重（用户约定算法）。
+
+    规则：
+    1. 拿后一段与前文各段从首字开始逐字比对；首个不同字出现即两段互异、跳过；
+    2. 若比对出的重复前缀字数 > 4 个字，则删除后一段中的全部重复前缀部分；
+       删完为空的段落整段移除；
+    3. 一轮删完后再整体重扫，直到一页内段落之间不再有相互重复的前缀为止
+       （设轮次上限防极端抖动）。
+    返回 (去重后段落列表, 被裁前缀段数, 整段删除数)。
+    """
+    out: list[str] = []
+    trimmed = removed = 0
+    work = [p.strip() for p in (paras or []) if p and p.strip()]
+    for _ in range(PREFIX_DEDUPE_MAX_ROUNDS):
+        changed = 0
+        out = []
+        for para in work:
+            hit = False
+            for prev in out:
+                n = shared_prefix_len(prev, para)
+                if n >= min_shared:  # 重复字数大于 4 才处理
+                    rest = para[n:].strip()
+                    if rest:
+                        out.append(rest)
+                        trimmed += 1
+                    else:
+                        removed += 1
+                    changed += 1
+                    hit = True
+                    break
+            if not hit:
+                out.append(para)
+        work = out
+        if not changed:
+            break
+    return out, trimmed, removed
+
+
+def dedupe_page_paragraph_prefixes(text: str, min_shared: int = PREFIX_DEDUPE_MIN_SHARED):
+    """页内段首前缀去重的文本版入口，返回 (新文本, 裁前缀段数, 整段删除数)。"""
+    paras = [p for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    kept, trimmed, removed = dedupe_prefix_in_paragraphs(paras, min_shared=min_shared)
+    return "\n\n".join(kept), trimmed, removed
+
+
+def dedupe_processed_pages(processed: list[dict], similarity=0.9,
+                           prefix_min_shared: int = 0) -> tuple[list[dict], int]:
     out = []
     recent_norms = []
     removed = 0
@@ -747,6 +860,12 @@ def dedupe_processed_pages(processed: list[dict], similarity=0.9) -> tuple[list[
             out.append(item)
             continue
         paras = [p.strip() for p in re.split(r"\n\s*\n", item.get("text") or "") if p.strip()]
+        # 第一遍：页内段首递归比对去重（同页段落互为前缀重复时，删后段重复部分）
+        paras, pref_trim, pref_rm = dedupe_prefix_in_paragraphs(
+            paras, min_shared=prefix_min_shared or PREFIX_DEDUPE_MIN_SHARED)
+        if pref_trim or pref_rm:
+            removed += pref_trim + pref_rm
+        # 第二遍：跨页历史窗口相似度去重
         kept, rm, recent_norms = dedupe_paragraphs_with_history(
             paras, recent_norms=recent_norms, similarity=similarity
         )
@@ -910,7 +1029,11 @@ def page_text_ends_cleanly(text: str) -> bool:
     return tail[-1:] in "。！？；：”』」》…!?;:）)"
 
 
-TOC_LINE_RE = re.compile(r"^(?P<title>.+?)(?:\s*[·•●•‧・.\-_…⋯]{2,}\s*|\s{2,})(?P<page>[0-9]{1,4})\s*$")
+# 目录行分隔符：连续点线（……）、带空格的点线（· · · ·）、或标题与页码间的空白。
+# 注意：OCR 文本常被压缩成单空格，"标题 52" 也算目录行（仅在目录页上下文里使用）。
+TOC_LINE_RE = re.compile(
+    r"^(?P<title>.{2,}?)(?:\s*[·•●•‧•・._…⋯][\s·•●•‧•・._…⋯]*\s*|\s+)(?P<page>[0-9]{1,4})\s*$"
+)
 
 
 def extract_toc_entries_from_text(text: str) -> list[tuple[str, int]]:
@@ -932,8 +1055,93 @@ def extract_toc_entries_from_text(text: str) -> list[tuple[str, int]]:
                 entries.append((title, page))
             pending = ""
             continue
-        pending = line if len(line) <= 40 else ""
+        # 标题碎片挂起等下一行拼接；以句末标点收尾的行是普通正文，不挂起
+        pending = line if len(line) <= 40 and not line.endswith(("。", "！", "？", "；")) else ""
     return entries
+
+
+# ---------- 自动结构页识别（封面/封底/扉页/版权/目录） ----------
+# 适用大多数扫描书的启发式：版权页看关键词，目录页看"标题…页码"行密度，
+# 封面/封底看首尾低文字量，扉页看前部短文本。识别结果只做建议，
+# 人工分章面板里留空的字段会自动落到这些建议值上，可随时覆盖。
+COPYRIGHT_KEYWORDS_RE = re.compile(
+    r"(版权所有|著作权|ISBN|书\s*号|出版发行|版\s*次|印\s*次|印\s*张|开\s*本"
+    r"|责任编辑|装帧设计|封面设计|定\s*价|新华书店|排版印制|出版社)"
+)
+TOC_HEADING_RE = re.compile(r"^\s*(目\s*录|目\s*次|contents?)\s*$", re.I)
+PAGE_CLASSIFY_TOC_MIN_HITS = 4        # 目录页最少目录行数
+PAGE_CLASSIFY_FRONT_WINDOW = 6        # 扉页判定只看前 6 个文字页
+PAGE_CLASSIFY_COVER_MAX_CHARS = 60    # 封面/封底最大正文字数
+PAGE_CLASSIFY_TITLE_MAX_CHARS = 120   # 扉页最大正文字数
+PAGE_CLASSIFY_TITLE_MAX_LINES = 6     # 扉页最大行数
+AUTO_PAGE_TYPES = ("cover", "back_cover", "title_page", "copyright", "toc")
+
+
+def classify_page_type(text: str, page_no: int, total_pages: int, pos: int = 0):
+    """对单页 OCR 文本做结构页判定。
+
+    返回 None 表示普通正文页；否则返回
+    cover / back_cover / title_page / copyright / toc 之一。
+    page_no 为 PDF 物理页码（1 起），pos 为该页在文字页序列中的位置（0 起）。
+    """
+    t = (text or "").strip()
+    n_chars = text_char_count(t)
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    first = lines[0] if lines else ""
+
+    # 目录页：显式目录头，或"标题…页码"行足够多
+    if TOC_HEADING_RE.match(first):
+        return "toc"
+    if len(extract_toc_entries_from_text(t)) >= PAGE_CLASSIFY_TOC_MIN_HITS:
+        return "toc"
+    # 版权页：版权关键词命中（误报率低）
+    if COPYRIGHT_KEYWORDS_RE.search(t):
+        return "copyright"
+    # 封面：第 1 个文字页且几乎无正文
+    if pos == 0 and page_no <= 2 and n_chars <= PAGE_CLASSIFY_COVER_MAX_CHARS:
+        return "cover"
+    # 封底：最后一个文字页且几乎无正文
+    if total_pages and pos == total_pages - 1 \
+            and n_chars <= PAGE_CLASSIFY_COVER_MAX_CHARS:
+        return "back_cover"
+    # 扉页：前部窗口内、行数少、字数少、不含整句标点（书名 + 作者/出版社名），
+    # 且首行不是章节标题行（章节首页是正文，不是扉页）
+    if pos < PAGE_CLASSIFY_FRONT_WINDOW and page_no <= PAGE_CLASSIFY_FRONT_WINDOW + 2 \
+            and n_chars <= PAGE_CLASSIFY_TITLE_MAX_CHARS and len(lines) <= PAGE_CLASSIFY_TITLE_MAX_LINES \
+            and not any(ln.endswith(("。", "！", "？", "；")) and len(ln) > 8 for ln in lines) \
+            and not any(is_chapter_line(ln) for ln in lines[:3]):
+        return "title_page"
+    return None
+
+
+def auto_classify_pages(processed: list[dict]) -> dict:
+    """自动识别结构页。返回 {类型: [页码...]}（每类升序列表）。"""
+    text_items = sorted(
+        (p for p in (processed or []) if not p.get("illustration") and (p.get("text") or "").strip()),
+        key=lambda p: int(p.get("page", 0)),
+    )
+    total = len(text_items)
+    found = {k: [] for k in AUTO_PAGE_TYPES}
+    for pos, item in enumerate(text_items):
+        kind = classify_page_type(item.get("text") or "", int(item.get("page", 0)), total, pos=pos)
+        if kind:
+            found[kind].append(int(item.get("page", 0)))
+    for kind in AUTO_PAGE_TYPES:
+        found[kind] = sorted(set(found[kind]))
+    return found
+
+
+def describe_auto_pages(auto_pages: dict) -> str:
+    """给日志用的结构页摘要。"""
+    zh = {"cover": "封面", "back_cover": "封底", "title_page": "扉页",
+          "copyright": "版权", "toc": "目录"}
+    parts = []
+    for kind in AUTO_PAGE_TYPES:
+        pages = (auto_pages or {}).get(kind) or []
+        if pages:
+            span = "{}".format(pages[0]) if len(pages) == 1 else "{}-{}".format(pages[0], pages[-1])
+            parts.append("{}={}（{}页）".format(zh[kind], span, len(pages)))
+    return "、".join(parts)
 
 
 def map_toc_page_to_actual(page_no: int, body_pages: list[int]) -> int | None:
@@ -1038,7 +1246,14 @@ def has_manual_chapter_config(cfg: dict) -> bool:
     return bool((cfg or {}).get("chapter_config_enabled"))
 
 
-def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: list[dict]) -> list[tuple[str, str]]:
+def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: list[dict],
+                          auto_pages: dict | None = None) -> list[tuple[str, str]]:
+    """按"人工分章面板 + 自动结构页识别"生成章节。
+
+    规则：面板里填了的字段按人工为准；留空的字段回退到自动识别结果。
+    这样自动识别与全部人工选择两条路径并行，互不冲突。
+    """
+    auto_pages = auto_pages or {}
     pages_by_no = {}
     for item in sorted(processed, key=lambda x: int(x.get("page", 0))):
         page = int(item.get("page", 0))
@@ -1052,15 +1267,19 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
     front_sections = []
     toc_selected = []
 
-    def add_single(key, title):
+    def add_single(key, title, auto_list=None):
         page = _cfg_page_value((cfg or {}).get(key))
+        if page is None and auto_list:
+            page = auto_list[0]  # 留空 → 用自动识别建议
         if page in pages_by_no and page not in assigned:
             assigned.add(page)
             front_sections.append((title, [page]))
 
-    def add_span(key, title):
+    def add_span(key, title, auto_list=None):
         nonlocal toc_selected
         span = _cfg_page_span((cfg or {}).get(key))
+        if not span and auto_list:
+            span = (min(auto_list), max(auto_list))  # 留空 → 自动识别范围
         if not span:
             return
         left, right = span
@@ -1071,11 +1290,11 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
             if title == "目录":
                 toc_selected = list(selected)
 
-    add_single("cover_page", "封面")
-    add_single("back_cover_page", "封底")
-    add_single("title_page", "扉页")
-    add_single("copyright_page", "版权页")
-    add_span("toc_page_range", "目录")
+    add_single("cover_page", "封面", auto_pages.get("cover"))
+    add_single("back_cover_page", "封底", auto_pages.get("back_cover"))
+    add_single("title_page", "扉页", auto_pages.get("title_page"))
+    add_single("copyright_page", "版权页", auto_pages.get("copyright"))
+    add_span("toc_page_range", "目录", auto_pages.get("toc"))
     add_span("preface_page_range", "序言")
 
     out = []
@@ -2517,6 +2736,7 @@ def run_job(job_id):
         job["status"] = "running"
         job["started_at"] = time.time()
         cfg = dict(job["config"])
+    apply_recommended_defaults(cfg)  # 缺失项补推荐默认值（人工已填不动）
     try:
         log(job_id, "任务开始")
         pdf_path = Path(job["pdf_path"])
@@ -2672,14 +2892,31 @@ def run_job(job_id):
                 recent_page_norms.append(normalized_text_for_dedup(body_text))
             if notes:
                 all_notes.extend(notes)
-        processed, dedup_removed = dedupe_processed_pages(processed)
+        processed, dedup_removed = dedupe_processed_pages(
+            processed,
+            similarity=float(cfg.get("dedupe_similarity") or 0.9),
+            prefix_min_shared=int(cfg.get("prefix_dedupe_min_shared") or 0))
         if dedup_removed:
             log(job_id, f"跨页去重删除 {dedup_removed} 段重复正文")
         structured_chapters = []
+        # 自动结构页识别（默认开启，可关掉只走人工/全书签路径）
+        auto_pages = {}
+        if cfg.get("auto_page_classify", True):
+            auto_pages = auto_classify_pages(processed)
+            if any(auto_pages.get(k) for k in AUTO_PAGE_TYPES):
+                log(job_id, "自动识别结构页：" + describe_auto_pages(auto_pages))
         if has_manual_chapter_config(cfg):
-            structured_chapters = build_manual_chapters(processed, cfg, pdf_toc_chapters)
+            # 人工分章面板：填了的字段按人工，留空的字段回退自动识别（并行不冲突）
+            structured_chapters = build_manual_chapters(processed, cfg, pdf_toc_chapters,
+                                                         auto_pages=auto_pages)
             if structured_chapters:
                 log(job_id, f"按人工分页规则生成 {len(structured_chapters)} 个章节/前置部分")
+        elif auto_pages and any(auto_pages.get(k) for k in AUTO_PAGE_TYPES):
+            # 未开人工面板但自动识别到结构页：直接用自动结果划分
+            structured_chapters = build_manual_chapters(processed, {}, pdf_toc_chapters,
+                                                         auto_pages=auto_pages)
+            if structured_chapters:
+                log(job_id, f"按自动识别结构页生成 {len(structured_chapters)} 个章节/前置部分")
         elif pdf_toc_chapters:
             structured_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters)
         normalized_toc_chapters = []

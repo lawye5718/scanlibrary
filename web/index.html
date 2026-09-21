@@ -144,31 +144,34 @@
         <input id="fRange" placeholder="留空处理全书" disabled/>
       </div>
       <div style="grid-column:1/-1">
-        <label class="chk"><input type="checkbox" id="fChapterAssist" checked/> 启用人工辅助分页/分章（可指定封面、目录、序言与正文切章规则）</label>
+        <label class="chk"><input type="checkbox" id="fAutoClassify" checked/> 自动识别结构页（封面/封底/扉页/版权/目录，适合大多数扫描书；识别结果可在日志中核对）</label>
+      </div>
+      <div style="grid-column:1/-1">
+        <label class="chk"><input type="checkbox" id="fChapterAssist" checked/> 启用人工辅助分页/分章（留空的字段自动沿用上行的自动识别结果，可逐项覆盖）</label>
       </div>
       <div>
         <label>封面页（单页）</label>
-        <input id="fCoverPage" type="number" value="1" min="1"/>
+        <input id="fCoverPage" type="number" value="" min="1" placeholder="留空=自动"/>
       </div>
       <div>
         <label>封底页（单页）</label>
-        <input id="fBackCoverPage" type="number" value="2" min="1"/>
+        <input id="fBackCoverPage" type="number" value="" min="1" placeholder="留空=自动"/>
       </div>
       <div>
         <label>扉页（单页）</label>
-        <input id="fTitlePage" type="number" value="3" min="1"/>
+        <input id="fTitlePage" type="number" value="" min="1" placeholder="留空=自动"/>
       </div>
       <div>
         <label>版权页（单页）</label>
-        <input id="fCopyrightPage" type="number" value="4" min="1"/>
+        <input id="fCopyrightPage" type="number" value="" min="1" placeholder="留空=自动"/>
       </div>
       <div>
         <label>目录页范围</label>
-        <input id="fTocRange" value="5-6" placeholder="例如 5-6"/>
+        <input id="fTocRange" value="" placeholder="留空=自动，或如 5-6"/>
       </div>
       <div>
         <label>序言页范围</label>
-        <input id="fPrefaceRange" value="7-8" placeholder="例如 7-8"/>
+        <input id="fPrefaceRange" value="" placeholder="留空=不划序言，或如 7-8"/>
       </div>
       <div>
         <label>正文分章方式</label>
@@ -196,7 +199,7 @@
       分页结果会缓存 —— 测试满意后跑全书时，前 10 页不会重复转换。
     </div>
     <div class="hint" id="chapterHint">
-      当前按目录页自动分章；若目录识别不稳，可切换为“按人工指定页数批量截取”，系统会在目标页后顺延到明显段落结束处再收章。
+      自动识别结构页已开启（推荐默认）；下方留空的字段将直接采用自动识别结果，填了则按人工为准。目录识别不稳时可切换“按人工指定页数批量截取”。
     </div>
   </div>
 
@@ -295,6 +298,7 @@ $("#fMode").onchange = () => {
 };
 $("#fChapterMethod").onchange = updateChapterHint;
 $("#fChapterAssist").onchange = updateChapterHint;
+$("#fAutoClassify").onchange = updateChapterHint;
 updateChapterHint();
 
 function parseRange(){
@@ -313,15 +317,18 @@ function parseLooseRange(id){
 function updateChapterHint(){
   const enabled = $("#fChapterAssist").checked;
   const fixed = $("#fChapterMethod").value === "fixed";
+  const autoOn = $("#fAutoClassify").checked;
   ["#fCoverPage","#fBackCoverPage","#fTitlePage","#fCopyrightPage","#fTocRange","#fPrefaceRange","#fChapterMethod"].forEach(id => {
     $(id).disabled = !enabled;
   });
   $("#fChapterPages").disabled = !enabled || !fixed;
   $("#chapterHint").textContent = !enabled
-    ? "当前沿用系统自动切章；需要人工辅助时再勾选上面的分页/分章选项。"
+    ? (autoOn
+        ? "未启用人工分章：系统按自动识别的结构页划分（封面/封底/扉页/版权/目录），并优先用目录页分章。"
+        : "未启用人工分章：系统沿用全书签/自动切章。")
     : fixed
-    ? "当前按人工指定页数批量截取；系统会以目标页数为基准，若该页段落未完则自动顺延到明显分段结束处再收章。"
-    : "当前按目录页自动分章；若目录识别不稳，可切换为“按人工指定页数批量截取”，系统会在目标页后顺延到明显段落结束处再收章。";
+    ? "自动识别" + (autoOn ? "开" : "关") + "；当前按人工指定页数批量截取，留空字段会沿用自动识别结果，填了按人工为准。"
+    : "自动识别" + (autoOn ? "开" : "关") + "；当前按目录页自动分章，留空字段会沿用自动识别结果，填了按人工为准；目录识别不稳可切换批量截取。";
 }
 
 function config(){
@@ -338,12 +345,13 @@ function config(){
     proof_chunk_chars: parseInt($("#fProofChunk").value) || 700,
     force_reocr: $("#fForce").checked,
     chapter_config_enabled: $("#fChapterAssist").checked,
-    cover_page: parseInt($("#fCoverPage").value) || 1,
-    back_cover_page: parseInt($("#fBackCoverPage").value) || 2,
-    title_page: parseInt($("#fTitlePage").value) || 3,
-    copyright_page: parseInt($("#fCopyrightPage").value) || 4,
-    toc_page_range: parseLooseRange("#fTocRange") || [5, 6],
-    preface_page_range: parseLooseRange("#fPrefaceRange") || [7, 8],
+    auto_page_classify: $("#fAutoClassify").checked,
+    cover_page: parseInt($("#fCoverPage").value) || null,
+    back_cover_page: parseInt($("#fBackCoverPage").value) || null,
+    title_page: parseInt($("#fTitlePage").value) || null,
+    copyright_page: parseInt($("#fCopyrightPage").value) || null,
+    toc_page_range: parseLooseRange("#fTocRange"),
+    preface_page_range: parseLooseRange("#fPrefaceRange"),
     chapter_method: $("#fChapterMethod").value,
     chapter_target_pages: parseInt($("#fChapterPages").value) || 20,
     lang: "zh-CN",
