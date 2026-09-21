@@ -368,6 +368,12 @@ def image_marker_md(img_path: Path, label: str = "插图") -> str:
     return f"![{label}](images/{img_path.name})"
 
 
+def safe_epub_asset_name(name: str) -> str:
+    base = Path(name).name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip(".-")
+    return safe or "asset.bin"
+
+
 def likely_full_page_illustration(img_path: Path) -> bool:
     """粗略判定整页大图：低留白 + 绝大多数行都被图像覆盖。"""
     try:
@@ -946,9 +952,11 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                 if not asset.is_file():
                     continue
                 mime = mimetypes.guess_type(asset.name)[0] or "application/octet-stream"
-                z.writestr(f"OEBPS/images/{asset.name}", asset.read_bytes())
-                asset_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", asset.name)
-                manifest.append(f'    <item id="asset-{asset_id}" href="images/{asset.name}" media-type="{mime}"/>')
+                safe_name = safe_epub_asset_name(asset.name)
+                href = html.escape(f"images/{safe_name}", quote=True)
+                z.writestr(f"OEBPS/images/{safe_name}", asset.read_bytes())
+                asset_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", safe_name)
+                manifest.append(f'    <item id="asset-{asset_id}" href="{href}" media-type="{mime}"/>')
 
         for i, chapter in enumerate(chapters):
             ctitle = chapter["title"]
@@ -1244,12 +1252,16 @@ def run_job(job_id):
         log(job_id, "切分章节并生成 EPUB")
         raw_chapters = split_chapters(full)
         chapters = []
+        epub_notes = []
+        epub_note_ids = set()
         for title0, body0 in raw_chapters:
             body_with_refs, chapter_notes = note_refs_for_epub(body0, all_notes)
             idx = len(chapters) + 1
             fname = f"chap_{idx:04d}.xhtml"
             for note in chapter_notes:
-                note["chapter_href"] = fname
+                if note["id"] not in epub_note_ids:
+                    epub_notes.append({**note, "chapter_href": fname})
+                    epub_note_ids.add(note["id"])
             chapters.append({
                 "title": title0,
                 "body": body_with_refs,
@@ -1258,7 +1270,9 @@ def run_job(job_id):
         if not chapters:
             body_with_refs, chapter_notes = note_refs_for_epub(full, all_notes)
             for note in chapter_notes:
-                note["chapter_href"] = "chap_0001.xhtml"
+                if note["id"] not in epub_note_ids:
+                    epub_notes.append({**note, "chapter_href": "chap_0001.xhtml"})
+                    epub_note_ids.add(note["id"])
             chapters = [{
                 "title": "正文",
                 "body": body_with_refs,
@@ -1268,7 +1282,7 @@ def run_job(job_id):
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
         build_epub(epub, job["title"], job.get("author", ""), chapters,
-                   lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir, notes=all_notes)
+                   lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir, notes=epub_notes)
         md_out = book_dir / f"{slug}.md"
         md_src = book_dir / ("book.proofread.md" if cfg.get("proofread") and (book_dir / "book.proofread.md").exists() else "book.md")
         if md_src != md_out:
