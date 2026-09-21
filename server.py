@@ -1486,22 +1486,25 @@ def run_job(job_id):
         log(job_id, "切分章节并生成 EPUB")
         raw_chapters = split_chapters(full)
         chapters = []
-        for title0, body0 in raw_chapters:
+        implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
+        if implicit_single:
+            body0 = raw_chapters[0][1]
             chapter_notes = collect_note_refs_for_epub(body0, all_notes)
-            chapters.append({
-                "title": title0,
+            chapters = [{
+                "title": "正文",
                 "body": body0,
                 "notes": chapter_notes,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
-            })
-        if not chapters:
-            chapter_notes = collect_note_refs_for_epub(full, all_notes)
-            chapters = [{
-                "title": "正文",
-                "body": full,
-                "notes": chapter_notes,
-                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
             }]
+        else:
+            for title0, body0 in raw_chapters:
+                chapter_notes = collect_note_refs_for_epub(body0, all_notes)
+                chapters.append({
+                    "title": title0,
+                    "body": body0,
+                    "notes": chapter_notes,
+                    "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
+                })
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
