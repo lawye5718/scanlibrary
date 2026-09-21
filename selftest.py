@@ -49,50 +49,51 @@ assert not server.proofread_chunk_guard(_o, _o + "补写" * 20)[0]  # 幻觉扩�
 assert not server.proofread_chunk_guard(_o, "")[0]             # 空返回
 assert server.proofread_chunk_guard("甲乙丙丁戊己庚辛", "甲乙丙丁 戊己庚辛")[0]
 
-# 端到端（假模型）：正常 / 偷懒 / 幻觉 / 丢标记 / 异常 五类场景
+# 失败块一次对半重试：正常 / 偷懒 / 幻觉 / 丢标记 / 异常 五类场景
 _calls, _opts = {"n": 0}, []
 
 
 def _fake_chat(base, model, messages, options=None, timeout=600, keep_alive="30m"):
     _calls["n"] += 1
     _opts.append(options)
-    i = _calls["n"]
     body = messages[1]["content"].split("【本次待校对文本】\n", 1)[1] \
                               .rsplit("\n\n【输出要求】", 1)[0]
-    if i == 1:
+    if "第一段" in body:
         return body.replace("—", "一")
-    if i == 2:
+    if "第2段" in body and len(body) > 80:
         return body[:len(body) // 2]
-    if i == 3:
+    if "第3段" in body and len(body) > 80:
         return body + "幻觉内容" * 10
-    if i == 4:
+    if "第四段" in body and len(body) > 80:
         return body.replace("\ue0005\ue001", "")
-    if i == 5:
+    if "第5段" in body and len(body) > 80:
         raise RuntimeError("boom")
     return body.replace("校队", "校对")
 
 
 _real, server.ollama_chat_messages = server.ollama_chat_messages, _fake_chat
 _logs = []
+_records = []
 try:
     _out = server.proofread_with_llm(_book, "http://x", "fake",
-                                    {"proof_chunk_chars": 120}, "t",
-                                    lambda j, m: _logs.append(m))
+                                    {"proof_chunk_chars": 120, "proof_retry_min_chars": 40}, "t",
+                                    lambda j, m: _logs.append(m), records=_records)
 finally:
     server.ollama_chat_messages = _real
 
-assert _calls["n"] == 6
+assert _calls["n"] > 6
 assert "第一段。他说道这是第一段的正文" in _out                     # 正常→采纳
 assert "这段正常校对通过" in _out                                  # 正常→采纳
-assert _paras[1] in _out and _paras[2] in _out and _paras[4] in _out  # 偷懒/幻觉/异常→回退
-assert "[[NOTE_REF:5|⑤]]" in _out                                 # 丢标记→回退
+assert "[[NOTE_REF:5|⑤]]" in _out                                 # 引注标记保留
+assert any("." in str(r["i"]) for r in _records)                # 记录包含子块标号（如 2.a/2.b）
+assert any(r["status"] == "ok" and "." in str(r["i"]) for r in _records)  # 子块重试可通过
 assert all(o["temperature"] == 0.0 and o["top_p"] == 0.1 for o in _opts)  # 低温确定性
 assert all(any(k in m for m in _logs) for k in
-           ("疑似偷懒省略", "疑似幻觉扩写", "丢失引注标记", "请求失败", "校对完成"))
+           ("丢失引注标记", "对半切开重试一次", "校对完成"))
 assert "省略号" in server.PROOFREAD_SYSTEM_PROMPT
 assert "禁止润色" in server.PROOFREAD_SYSTEM_PROMPT
 assert "测试块" in server.PROOFREAD_USER_TEMPLATE.format(chunk="测试块")
-print("✅ 校对引擎单测通过（分块守恒/引注保护/兜底判定/五类场景回退/低温参数）")
+print("✅ 校对引擎单测通过（分块守恒/引注保护/兜底判定/失败块对半重试/低温参数）")
 
 srv = server.Server(("127.0.0.1", 8801), server.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
