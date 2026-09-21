@@ -1171,6 +1171,7 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             body = chapter["body"]
             chapter_notes = chapter.get("notes") or []
             fname = f"chap_{i + 1:04d}.xhtml"
+            body_for_render = body if chapter_notes else render_note_refs_as_text(body)
             note_ref_counts = {}
             note_backrefs = {}
 
@@ -1182,8 +1183,8 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                 return ref_id
 
             xhtml = md_to_xhtml(
-                body,
-                note_href_builder=(lambda nid: f"#note-{nid}" if chapter_notes else f"notes.xhtml#note-{nid}"),
+                body_for_render,
+                note_href_builder=(lambda nid: f"#note-{nid}"),
                 note_ref_id_builder=note_ref_id_builder,
             )
             note_html = ""
