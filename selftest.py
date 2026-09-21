@@ -212,6 +212,21 @@ body_text2, notes2, _ = server.extract_footnotes_from_page(
 assert "1. 研究背景" in body_text2 and not notes2, "正文编号段落不应被误抽成注释"
 assert not server.is_chapter_line("1. 研究背景")
 assert server.is_chapter_line("1. Chapter One")
+realistic_toc = """
+目 录
+
+第一章 总论 …………………… 1
+第二章 历史的转折
+……………………………… 2 7
+第三章 工业与金融  … …  5 9
+附录 主要人物表 …………… 301
+"""
+assert server.extract_toc_entries_from_text(realistic_toc) == [
+    ("第一章 总论", 1),
+    ("第二章 历史的转折", 27),
+    ("第三章 工业与金融", 59),
+    ("附录 主要人物表", 301),
+]
 stitched = server.merge_wrapped_lines(server.join_processed_pages([
     {"page": 1, "text": "这一段跨页未完", "illustration": False},
     {"page": 2, "text": "下一页接着写完。\n\n新一段。", "illustration": False},
@@ -226,26 +241,25 @@ print("✅ 注释抽取不会打乱正文")
 
 manual_processed = [
     {"page": 1, "text": "封面", "illustration": False},
-    {"page": 2, "text": "封底", "illustration": False},
-    {"page": 3, "text": "扉页", "illustration": False},
-    {"page": 4, "text": "版权页", "illustration": False},
-    {"page": 5, "text": "目录\n\n第一章 起始 …… 1\n第二章 收束 …… 3", "illustration": False},
-    {"page": 6, "text": "目录续", "illustration": False},
-    {"page": 7, "text": "序言第一页。", "illustration": False},
-    {"page": 8, "text": "序言第二页。", "illustration": False},
-    {"page": 9, "text": "第一章第一页。", "illustration": False},
-    {"page": 10, "text": "第一章第二页未完", "illustration": False},
-    {"page": 11, "text": "续页收束。", "illustration": False},
-    {"page": 12, "text": "下章第一页。", "illustration": False},
-    {"page": 13, "text": "下章第二页。", "illustration": False},
+    {"page": 2, "text": "扉页", "illustration": False},
+    {"page": 3, "text": "版权所有\nISBN 978-7-000-00000-0\n中国版本图书馆 CIP 数据核字", "illustration": False},
+    {"page": 4, "text": "目 录\n\n第一章 起始 ………… 1\n第二章 收束", "illustration": False},
+    {"page": 5, "text": "……………………………… 3\n附录 ………… 10", "illustration": False},
+    {"page": 6, "text": "序言\n\n序言第一页。", "illustration": False},
+    {"page": 7, "text": "序言第二页。", "illustration": False},
+    {"page": 8, "text": "第一章 起始\n\n第一章第一页。", "illustration": False},
+    {"page": 9, "text": "第一章第二页未完", "illustration": False},
+    {"page": 10, "text": "第二章 收束\n\n续页收束。", "illustration": False},
+    {"page": 11, "text": "下章第一页。", "illustration": False},
+    {"page": 12, "text": "封底", "illustration": False},
 ]
 manual_cfg = {
     "cover_page": 1,
-    "back_cover_page": 2,
-    "title_page": 3,
-    "copyright_page": 4,
-    "toc_page_range": [5, 6],
-    "preface_page_range": [7, 8],
+    "back_cover_page": 12,
+    "title_page": 2,
+    "copyright_page": 3,
+    "toc_page_range": [4, 5],
+    "preface_page_range": [6, 7],
     "chapter_method": "toc",
     "chapter_target_pages": 2,
 }
@@ -253,10 +267,21 @@ assert not server.has_manual_chapter_config(manual_cfg)
 manual_cfg_enabled = dict(manual_cfg, chapter_config_enabled=True)
 assert server.has_manual_chapter_config(manual_cfg_enabled)
 toc_chapters = server.build_manual_chapters(manual_processed, manual_cfg_enabled, [])
-assert [t for t, _ in toc_chapters[:6]] == ["封面", "封底", "扉页", "版权页", "目录", "序言"], toc_chapters
-assert [t for t, _ in toc_chapters[6:]] == ["第一章 起始", "第二章 收束"], toc_chapters
+assert [t for t, _ in toc_chapters[:5]] == ["封面", "扉页", "版权页", "目录", "序言"], toc_chapters
+assert [t for t, _ in toc_chapters[5:]] == ["第一章 起始", "第二章 收束", "附录", "封底"], toc_chapters
+auto_cfg = server.detect_auto_chapter_config(manual_processed, {"chapter_target_pages": 2})
+assert auto_cfg["cover_page"] == 1 and auto_cfg["back_cover_page"] == 12, auto_cfg
+assert auto_cfg["title_page"] == 2 and auto_cfg["copyright_page"] == 3, auto_cfg
+assert auto_cfg["toc_page_range"] == [4, 5] and auto_cfg["preface_page_range"] == [6, 7], auto_cfg
+auto_chapters, applied_cfg, source = server.build_structured_chapters(
+    manual_processed,
+    {"chapter_detection_mode": "auto", "chapter_config_enabled": True, "chapter_method": "toc", "chapter_target_pages": 2},
+    [],
+)
+assert source == "auto" and applied_cfg["toc_page_range"] == [4, 5], (source, applied_cfg)
+assert [t for t, _ in auto_chapters[:5]] == ["封面", "扉页", "版权页", "目录", "序言"], auto_chapters
 fixed_chapters = server.build_manual_chapters(
-    manual_processed[8:],
+    manual_processed[7:11],
     {"chapter_method": "fixed", "chapter_target_pages": 2},
     [],
 )
@@ -266,7 +291,7 @@ mixed_page_chapters = server.build_manual_chapters([
     {"page": 9, "text": server.image_marker_md(Path("plate.jpg"), "插图"), "illustration": True},
 ], {"chapter_method": "fixed", "chapter_target_pages": 1}, [])
 assert "正文页。" in mixed_page_chapters[0][1] and "![插图](images/plate.jpg)" in mixed_page_chapters[0][1], mixed_page_chapters
-print("✅ 人工分页分章（目录页/固定页数）可用")
+print("✅ 自动/人工分页分章（目录页/固定页数）可用")
 
 # EPUB 图片路径：正文中的插图必须指向 OEBPS/images/ 下的资源
 tmp_epub = ROOT / "books" / "图片测试.epub"

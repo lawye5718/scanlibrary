@@ -910,29 +910,69 @@ def page_text_ends_cleanly(text: str) -> bool:
     return tail[-1:] in "。！？；：”』」》…!?;:）)"
 
 
-TOC_LINE_RE = re.compile(r"^(?P<title>.+?)(?:\s*[·•●•‧・.\-_…⋯]{2,}\s*|\s{2,})(?P<page>[0-9]{1,4})\s*$")
+TOC_LINE_RE = re.compile(
+    r"^(?P<title>.+?)(?:\s*[·•●‧・.\-_…⋯]{2,}\s*|\s{2,})(?P<page>[0-9OoIl|lI ]{1,7})\s*$"
+)
+TOC_TRAILER_RE = re.compile(r"[·•●‧・.\-_…⋯]{2,}\s*[0-9OoIl|lI ]{1,7}\s*$")
+COPYRIGHT_HINT_RE = re.compile(
+    r"(?:ISBN|CIP|版权所有|出版发行|责任编辑|责任印制|版次|印次|定价|开本|印张|字数|中国版本图书馆)",
+    re.I,
+)
+PREFACE_TITLE_RE = re.compile(
+    r"^(?:序|序言|前言|引言|导言|导读|出版说明|再版说明|修订说明|内容提要|凡例|译者序|译后记|自序)$"
+)
+
+
+def _parse_toc_page_token(raw: str) -> int | None:
+    s = re.sub(r"\s+", "", str(raw or ""))
+    if not s:
+        return None
+    s = s.translate(str.maketrans({
+        "O": "0", "o": "0",
+        "I": "1", "l": "1", "|": "1",
+    }))
+    if not s.isdigit():
+        return None
+    page = int(s)
+    return page if page > 0 else None
+
+
+def _parse_toc_entry_candidate(line: str) -> tuple[str, int] | None:
+    m = TOC_LINE_RE.match(line or "")
+    if not m:
+        return None
+    title = normalize_pdf_chapter_title(m.group("title"))
+    page = _parse_toc_page_token(m.group("page"))
+    if not title or page is None:
+        return None
+    return title, page
 
 
 def extract_toc_entries_from_text(text: str) -> list[tuple[str, int]]:
     entries = []
-    pending = ""
+    pending_parts = []
     for raw in (text or "").splitlines():
         line = re.sub(r"\s+", " ", raw or "").strip()
         if not line:
             continue
         if re.fullmatch(r"(?:目\s*录|目录|contents?)", line, re.I):
-            pending = ""
+            pending_parts = []
             continue
-        probe = (pending + " " + line).strip() if pending else line
-        m = TOC_LINE_RE.match(probe)
-        if m:
-            title = normalize_pdf_chapter_title(m.group("title"))
-            page = int(m.group("page"))
-            if title and page > 0:
-                entries.append((title, page))
-            pending = ""
+        probe_parts = pending_parts + [line] if pending_parts else [line]
+        probe = " ".join(probe_parts).strip()
+        parsed = _parse_toc_entry_candidate(probe)
+        if parsed:
+            entries.append(parsed)
+            pending_parts = []
             continue
-        pending = line if len(line) <= 40 else ""
+        if len(line) <= 40 and len(" ".join(probe_parts)) <= 80:
+            pending_parts = probe_parts[-3:]
+            continue
+        if pending_parts and TOC_TRAILER_RE.search(line):
+            parsed = _parse_toc_entry_candidate(" ".join(pending_parts + [line]).strip())
+            if parsed:
+                entries.append(parsed)
+        pending_parts = []
     return entries
 
 
@@ -1038,6 +1078,195 @@ def has_manual_chapter_config(cfg: dict) -> bool:
     return bool((cfg or {}).get("chapter_config_enabled"))
 
 
+def chapter_config_mode(cfg: dict) -> str:
+    mode = str((cfg or {}).get("chapter_detection_mode") or "").strip().lower()
+    if mode in ("auto", "manual", "off"):
+        return mode
+    if not (cfg or {}).get("chapter_config_enabled"):
+        return "off"
+    for key in ("cover_page", "back_cover_page", "title_page", "copyright_page"):
+        if _cfg_page_value((cfg or {}).get(key)):
+            return "manual"
+    for key in ("toc_page_range", "preface_page_range"):
+        if _cfg_page_span((cfg or {}).get(key)):
+            return "manual"
+    return "auto"
+
+
+def first_nonempty_line(text: str) -> str:
+    for raw in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw or "").strip()
+        if line:
+            return line
+    return ""
+
+
+def looks_like_sparse_front_page(text: str, illustration=False, max_chars=120, max_lines=12) -> bool:
+    if illustration:
+        return True
+    lines = [re.sub(r"\s+", " ", raw or "").strip() for raw in (text or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return False
+    return text_char_count(text) <= max_chars and len(lines) <= max_lines
+
+
+def looks_like_toc_page(text: str) -> bool:
+    entries = extract_toc_entries_from_text(text)
+    if len(entries) >= 2:
+        return True
+    lines = [re.sub(r"\s+", " ", raw or "").strip() for raw in (text or "").splitlines()]
+    lines = [line for line in lines if line]
+    if not lines:
+        return False
+    hits = sum(1 for line in lines if _parse_toc_entry_candidate(line))
+    if hits >= 1 and any(re.fullmatch(r"(?:目\s*录|目录|contents?)", line, re.I) for line in lines[:3]):
+        return True
+    if any(re.fullmatch(r"(?:目\s*录|目录|contents?)", line, re.I) for line in lines[:3]):
+        dotted = sum(1 for line in lines if TOC_TRAILER_RE.search(line))
+        return dotted >= 2
+    return False
+
+
+def looks_like_copyright_page(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    hits = len(COPYRIGHT_HINT_RE.findall(s))
+    return hits >= 2 or bool(re.search(r"\bISBN\b", s, re.I) or re.search(r"\bCIP\b", s, re.I))
+
+
+def detect_auto_chapter_config(processed: list[dict], cfg: dict | None = None) -> dict:
+    pages_by_no = {}
+    for item in sorted(processed, key=lambda x: int(x.get("page", 0))):
+        page = int(item.get("page", 0))
+        if page <= 0:
+            continue
+        pages_by_no.setdefault(page, []).append(item)
+    ordered_pages = sorted(pages_by_no)
+    if not ordered_pages:
+        return {}
+
+    page_infos = []
+    for page in ordered_pages:
+        items = pages_by_no[page]
+        text = _page_text_for_chapter(items)
+        page_infos.append({
+            "page": page,
+            "text": text,
+            "first_line": first_nonempty_line(text),
+            "illustration": any(bool(it.get("illustration")) for it in items),
+        })
+    front_infos = page_infos[:min(len(page_infos), 18)]
+    detected = {
+        "chapter_method": str((cfg or {}).get("chapter_method") or "toc").strip().lower() or "toc",
+        "chapter_target_pages": int((cfg or {}).get("chapter_target_pages") or 20),
+    }
+
+    first_info = page_infos[0]
+    if looks_like_sparse_front_page(first_info["text"], first_info["illustration"], max_chars=90, max_lines=8):
+        detected["cover_page"] = first_info["page"]
+
+    last_info = page_infos[-1]
+    if len(page_infos) >= 4 and looks_like_sparse_front_page(last_info["text"], last_info["illustration"], max_chars=160, max_lines=14):
+        if not is_chapter_line(last_info["first_line"]):
+            detected["back_cover_page"] = last_info["page"]
+
+    for info in front_infos[:12]:
+        if info["page"] == detected.get("cover_page"):
+            continue
+        if looks_like_copyright_page(info["text"]):
+            detected["copyright_page"] = info["page"]
+            break
+
+    toc_cluster = []
+    current_cluster = []
+    for info in front_infos[:14]:
+        if looks_like_toc_page(info["text"]):
+            if current_cluster and info["page"] != current_cluster[-1] + 1:
+                if len(current_cluster) > len(toc_cluster):
+                    toc_cluster = current_cluster
+                current_cluster = []
+            current_cluster.append(info["page"])
+        elif current_cluster:
+            if len(current_cluster) > len(toc_cluster):
+                toc_cluster = current_cluster
+            current_cluster = []
+    if current_cluster and len(current_cluster) > len(toc_cluster):
+        toc_cluster = current_cluster
+    if toc_cluster:
+        detected["toc_page_range"] = [toc_cluster[0], toc_cluster[-1]]
+
+    front_taken = {
+        detected.get("cover_page"),
+        detected.get("copyright_page"),
+    }
+    toc_span = _cfg_page_span(detected.get("toc_page_range"))
+    toc_left, toc_right = toc_span if toc_span else (None, None)
+    for info in front_infos[:10]:
+        page = info["page"]
+        if page in front_taken:
+            continue
+        if toc_left and toc_left <= page <= toc_right:
+            continue
+        if looks_like_sparse_front_page(info["text"], info["illustration"], max_chars=120, max_lines=10):
+            if not looks_like_copyright_page(info["text"]) and not looks_like_toc_page(info["text"]) and not is_chapter_line(info["first_line"]):
+                detected["title_page"] = page
+                break
+
+    first_body_hint = None
+    toc_entries = []
+    if toc_span:
+        toc_entries = build_toc_chapters_from_pages(processed, list(range(toc_left, toc_right + 1)), ordered_pages)
+        if toc_entries:
+            first_body_hint = toc_entries[0]["start_page"]
+    after_front = max([
+        detected.get("cover_page") or 0,
+        detected.get("title_page") or 0,
+        detected.get("copyright_page") or 0,
+        toc_right or 0,
+    ])
+    preface_start = None
+    preface_end = None
+    for info in front_infos:
+        if info["page"] <= after_front:
+            continue
+        if first_body_hint and info["page"] >= first_body_hint:
+            break
+        if PREFACE_TITLE_RE.match(info["first_line"]):
+            preface_start = info["page"]
+            preface_end = info["page"]
+            continue
+        if preface_start is not None:
+            if is_chapter_line(info["first_line"]) or looks_like_toc_page(info["text"]):
+                break
+            preface_end = info["page"]
+            if first_body_hint and preface_end + 1 >= first_body_hint:
+                break
+    if preface_start is not None and preface_end is not None:
+        detected["preface_page_range"] = [preface_start, preface_end]
+    return detected
+
+
+def merge_auto_chapter_config(auto_cfg: dict, cfg: dict) -> dict:
+    merged = dict(auto_cfg or {})
+    src = cfg or {}
+    for key in ("cover_page", "back_cover_page", "title_page", "copyright_page"):
+        page = _cfg_page_value(src.get(key))
+        if page:
+            merged[key] = page
+    for key in ("toc_page_range", "preface_page_range"):
+        span = _cfg_page_span(src.get(key))
+        if span:
+            merged[key] = [span[0], span[1]]
+    method = str(src.get("chapter_method") or "").strip().lower()
+    if method in ("toc", "fixed"):
+        merged["chapter_method"] = method
+    if src.get("chapter_target_pages") not in (None, ""):
+        merged["chapter_target_pages"] = int(src.get("chapter_target_pages") or 20)
+    return merged
+
+
 def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: list[dict]) -> list[tuple[str, str]]:
     pages_by_no = {}
     for item in sorted(processed, key=lambda x: int(x.get("page", 0))):
@@ -1050,13 +1279,15 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
     ordered_pages = sorted(pages_by_no)
     assigned = set()
     front_sections = []
+    back_sections = []
     toc_selected = []
 
     def add_single(key, title):
         page = _cfg_page_value((cfg or {}).get(key))
         if page in pages_by_no and page not in assigned:
             assigned.add(page)
-            front_sections.append((title, [page]))
+            target = back_sections if title == "封底" else front_sections
+            target.append((title, [page]))
 
     def add_span(key, title):
         nonlocal toc_selected
@@ -1095,15 +1326,41 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
         toc_chapters = trim_toc_chapters_to_body(pdf_toc_chapters, body_page_nums)
     if method == "toc" and toc_chapters:
         out.extend(split_chapters_by_pdf_toc(body_processed, toc_chapters))
-        return out
-    if method == "toc":
+    elif method == "toc":
         body = _page_text_for_chapter(body_processed)
         if body:
-            out.append(("正文", body))
-        return out
-    pages_per_chapter = int((cfg or {}).get("chapter_target_pages") or 20)
-    out.extend(split_body_by_fixed_page_chunks(body_processed, pages_per_chapter=pages_per_chapter))
+            body_chapters = split_chapters(body)
+            if body_chapters:
+                out.extend(body_chapters)
+            else:
+                out.append(("正文", body))
+    else:
+        pages_per_chapter = int((cfg or {}).get("chapter_target_pages") or 20)
+        out.extend(split_body_by_fixed_page_chunks(body_processed, pages_per_chapter=pages_per_chapter))
+    for title, page_nums in back_sections:
+        body = _page_text_for_chapter([entry for p in page_nums for entry in pages_by_no[p]])
+        if body:
+            out.append((title, body))
     return out
+
+
+def build_structured_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: list[dict]):
+    mode = chapter_config_mode(cfg)
+    applied_cfg = None
+    source = None
+    structured = []
+    if mode == "manual":
+        applied_cfg = dict(cfg or {})
+        structured = build_manual_chapters(processed, applied_cfg, pdf_toc_chapters)
+        source = "manual"
+    elif mode == "auto":
+        applied_cfg = merge_auto_chapter_config(detect_auto_chapter_config(processed, cfg), cfg or {})
+        structured = build_manual_chapters(processed, applied_cfg, pdf_toc_chapters)
+        source = "auto"
+    elif pdf_toc_chapters:
+        structured = split_chapters_by_pdf_toc(processed, pdf_toc_chapters)
+        source = "pdf_toc"
+    return structured, applied_cfg, source
 
 
 def dedupe_layout_parts(parts: list[tuple[int, int, str]], similarity=0.985):
@@ -2675,13 +2932,32 @@ def run_job(job_id):
         processed, dedup_removed = dedupe_processed_pages(processed)
         if dedup_removed:
             log(job_id, f"跨页去重删除 {dedup_removed} 段重复正文")
-        structured_chapters = []
-        if has_manual_chapter_config(cfg):
-            structured_chapters = build_manual_chapters(processed, cfg, pdf_toc_chapters)
-            if structured_chapters:
-                log(job_id, f"按人工分页规则生成 {len(structured_chapters)} 个章节/前置部分")
-        elif pdf_toc_chapters:
-            structured_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters)
+        structured_chapters, applied_chapter_cfg, chapter_source = build_structured_chapters(
+            processed, cfg, pdf_toc_chapters
+        )
+        if structured_chapters and chapter_source == "manual":
+            log(job_id, f"按人工分页规则生成 {len(structured_chapters)} 个章节/前置部分")
+        elif structured_chapters and chapter_source == "auto":
+            summary = []
+            for key, label in (
+                ("cover_page", "封面"),
+                ("back_cover_page", "封底"),
+                ("title_page", "扉页"),
+                ("copyright_page", "版权页"),
+            ):
+                if applied_chapter_cfg and applied_chapter_cfg.get(key):
+                    summary.append(f"{label}{applied_chapter_cfg[key]}页")
+            for key, label in (("toc_page_range", "目录"), ("preface_page_range", "序言")):
+                span = _cfg_page_span((applied_chapter_cfg or {}).get(key))
+                if span:
+                    summary.append(f"{label}{span[0]}-{span[1]}页")
+            log(job_id, "自动识别分页/分章：" + ("，".join(summary) if summary else "已启用"))
+            log(job_id, f"自动划分出 {len(structured_chapters)} 个章节/前置部分；需要时可在上传面板填写页码覆盖")
+        if applied_chapter_cfg:
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]["applied_chapter_config"] = applied_chapter_cfg
+                    JOBS[job_id]["chapter_source"] = chapter_source
         normalized_toc_chapters = []
         if structured_chapters:
             normalized_toc_chapters = [

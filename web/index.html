@@ -133,7 +133,7 @@
       </div>
       <div>
         <label>渲染 DPI（扫描件建议 200–300）</label>
-        <input id="fDpi" type="number" value="200" min="72" max="600"/>
+        <input id="fDpi" type="number" value="250" min="72" max="600"/>
       </div>
       <div>
         <label>并发页数（内存小就填 1）</label>
@@ -144,31 +144,36 @@
         <input id="fRange" placeholder="留空处理全书" disabled/>
       </div>
       <div style="grid-column:1/-1">
-        <label class="chk"><input type="checkbox" id="fChapterAssist" checked/> 启用人工辅助分页/分章（可指定封面、目录、序言与正文切章规则）</label>
+        <label>分页/分章方案</label>
+        <select id="fChapterMode">
+          <option value="auto">自动识别（推荐；留空时自动识别，填写可覆盖）</option>
+          <option value="manual">全部人工指定</option>
+          <option value="off">关闭辅助，交给系统默认切章</option>
+        </select>
       </div>
       <div>
-        <label>封面页（单页）</label>
-        <input id="fCoverPage" type="number" value="1" min="1"/>
+        <label>封面页（单页，留空=自动）</label>
+        <input id="fCoverPage" type="number" min="1" placeholder="例如 1"/>
       </div>
       <div>
-        <label>封底页（单页）</label>
-        <input id="fBackCoverPage" type="number" value="2" min="1"/>
+        <label>封底页（单页，留空=自动）</label>
+        <input id="fBackCoverPage" type="number" min="1" placeholder="例如 2"/>
       </div>
       <div>
-        <label>扉页（单页）</label>
-        <input id="fTitlePage" type="number" value="3" min="1"/>
+        <label>扉页（单页，留空=自动）</label>
+        <input id="fTitlePage" type="number" min="1" placeholder="例如 3"/>
       </div>
       <div>
-        <label>版权页（单页）</label>
-        <input id="fCopyrightPage" type="number" value="4" min="1"/>
+        <label>版权页（单页，留空=自动）</label>
+        <input id="fCopyrightPage" type="number" min="1" placeholder="例如 4"/>
       </div>
       <div>
-        <label>目录页范围</label>
-        <input id="fTocRange" value="5-6" placeholder="例如 5-6"/>
+        <label>目录页范围（留空=自动）</label>
+        <input id="fTocRange" placeholder="例如 5-6"/>
       </div>
       <div>
-        <label>序言页范围</label>
-        <input id="fPrefaceRange" value="7-8" placeholder="例如 7-8"/>
+        <label>序言页范围（留空=自动）</label>
+        <input id="fPrefaceRange" placeholder="例如 7-8"/>
       </div>
       <div>
         <label>正文分章方式</label>
@@ -191,12 +196,15 @@
       不勾校对时：转换一结束就打包 EPUB，不做任何大模型校对，速度最快。
       想校对随时可在下方「③ 单独校对」里对已完成的成书补做，不影响原始产出。
     </div>
+    <div class="hint">
+      大多数扫描书建议直接用默认组合：<span class="kbd">paddle-layout</span> + <span class="kbd">glm-ocr</span> + <span class="kbd">250 DPI</span> + <span class="kbd">并发 1</span> + <span class="kbd">自动识别分页/分章</span>；只有字很小、扫描发虚时再把 DPI 提到 300。
+    </div>
     <div class="hint" id="modeHint">
       当前为测试版模式：只转换前 10 页生成「试读版 EPUB」，验证 OCR 效果后再切换全书模式。
       分页结果会缓存 —— 测试满意后跑全书时，前 10 页不会重复转换。
     </div>
     <div class="hint" id="chapterHint">
-      当前按目录页自动分章；若目录识别不稳，可切换为“按人工指定页数批量截取”，系统会在目标页后顺延到明显段落结束处再收章。
+      当前自动识别封面、扉页、版权页、目录页与序言；留空保持自动，填写页码可覆盖识别结果。
     </div>
   </div>
 
@@ -294,7 +302,7 @@ $("#fMode").onchange = () => {
   }
 };
 $("#fChapterMethod").onchange = updateChapterHint;
-$("#fChapterAssist").onchange = updateChapterHint;
+$("#fChapterMode").onchange = updateChapterHint;
 updateChapterHint();
 
 function parseRange(){
@@ -310,18 +318,30 @@ function parseLooseRange(id){
   return m ? [parseInt(m[1]), parseInt(m[2])] : v.match(/^\d+$/) ? [parseInt(v), parseInt(v)] : null;
 }
 
+function parseOptionalInt(id){
+  const v = $(id).value.trim();
+  if(!v) return null;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 function updateChapterHint(){
-  const enabled = $("#fChapterAssist").checked;
+  const mode = $("#fChapterMode").value;
+  const enabled = mode !== "off";
   const fixed = $("#fChapterMethod").value === "fixed";
   ["#fCoverPage","#fBackCoverPage","#fTitlePage","#fCopyrightPage","#fTocRange","#fPrefaceRange","#fChapterMethod"].forEach(id => {
     $(id).disabled = !enabled;
   });
   $("#fChapterPages").disabled = !enabled || !fixed;
   $("#chapterHint").textContent = !enabled
-    ? "当前沿用系统自动切章；需要人工辅助时再勾选上面的分页/分章选项。"
-    : fixed
-    ? "当前按人工指定页数批量截取；系统会以目标页数为基准，若该页段落未完则自动顺延到明显分段结束处再收章。"
-    : "当前按目录页自动分章；若目录识别不稳，可切换为“按人工指定页数批量截取”，系统会在目标页后顺延到明显段落结束处再收章。";
+    ? "当前关闭分页/分章辅助；系统会直接按 PDF 书签或正文标题自行切章。"
+    : mode === "manual"
+    ? (fixed
+      ? "当前全部按人工指定页码/范围处理；正文按目标页数批量截取，并在段落结束处再收章。"
+      : "当前全部按人工指定页码/范围处理；正文优先按你提供的目录页或 PDF 书签切章。")
+    : (fixed
+      ? "当前先自动识别封面、扉页、版权页、目录页与序言；留空时保持自动，正文按目标页数批量截取。"
+      : "当前先自动识别封面、扉页、版权页、目录页与序言；留空时保持自动，正文优先按目录页或 PDF 书签切章。");
 }
 
 function config(){
@@ -337,13 +357,14 @@ function config(){
     proof_model: $("#fProofModel").value.trim() || "qwen14b-pro",
     proof_chunk_chars: parseInt($("#fProofChunk").value) || 700,
     force_reocr: $("#fForce").checked,
-    chapter_config_enabled: $("#fChapterAssist").checked,
-    cover_page: parseInt($("#fCoverPage").value) || 1,
-    back_cover_page: parseInt($("#fBackCoverPage").value) || 2,
-    title_page: parseInt($("#fTitlePage").value) || 3,
-    copyright_page: parseInt($("#fCopyrightPage").value) || 4,
-    toc_page_range: parseLooseRange("#fTocRange") || [5, 6],
-    preface_page_range: parseLooseRange("#fPrefaceRange") || [7, 8],
+    chapter_detection_mode: $("#fChapterMode").value,
+    chapter_config_enabled: $("#fChapterMode").value !== "off",
+    cover_page: parseOptionalInt("#fCoverPage"),
+    back_cover_page: parseOptionalInt("#fBackCoverPage"),
+    title_page: parseOptionalInt("#fTitlePage"),
+    copyright_page: parseOptionalInt("#fCopyrightPage"),
+    toc_page_range: parseLooseRange("#fTocRange"),
+    preface_page_range: parseLooseRange("#fPrefaceRange"),
     chapter_method: $("#fChapterMethod").value,
     chapter_target_pages: parseInt($("#fChapterPages").value) || 20,
     lang: "zh-CN",
