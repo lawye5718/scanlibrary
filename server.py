@@ -1488,10 +1488,11 @@ def run_job(job_id):
         chapters = []
         implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
         if implicit_single:
+            title0 = raw_chapters[0][0] or "正文"
             body0 = raw_chapters[0][1]
             chapter_notes = collect_note_refs_for_epub(body0, all_notes)
             chapters = [{
-                "title": "正文",
+                "title": title0,
                 "body": body0,
                 "notes": chapter_notes,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
