@@ -1,0 +1,8 @@
+# ScanLibrary 只有一个硬依赖：把 PDF 页渲染成图片
+pymupdf>=1.24
+
+# 说明：
+#  - Ollama 请以桌面版或 `brew install ollama` 单独安装，不在 Python 依赖里。
+#  - OCR 视觉模型：ollama pull glm-ocr        （约 2.2GB，只需一次）
+#  - 可选后端 MinerU：uv pip install -U "mineru[core,mlx]"（M 芯片 Mac）
+#  - 本程序自带 EPUB 打包，不需要 pandoc / Calibre。

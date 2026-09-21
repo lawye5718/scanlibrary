@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ScanLibrary · 扫描书转 EPUB</title>
+<style>
+  :root{
+    --bg:#f6f5f1; --card:#fff; --ink:#23201c; --muted:#7a736a;
+    --line:#e5e1d8; --accent:#8a5a2b; --ok:#3f7d4e; --err:#b3453a;
+    --run:#b8860b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font-family:-apple-system,"PingFang SC","Noto Sans CJK SC","Microsoft YaHei",sans-serif;}
+  header{padding:18px 24px;border-bottom:1px solid var(--line);background:#fff;
+         display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  header h1{margin:0;font-size:19px;letter-spacing:.5px}
+  header .sub{color:var(--muted);font-size:13px}
+  header .spacer{flex:1}
+  .wrap{max-width:1080px;margin:0 auto;padding:20px 24px 60px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:16px}
+  h2{font-size:15px;margin:0 0 12px;color:var(--accent);letter-spacing:.5px}
+  /* 上传区 */
+  #drop{border:2px dashed #cfc8bb;border-radius:10px;padding:34px 20px;text-align:center;
+        cursor:pointer;transition:.15s;background:#fdfcfa}
+  #drop:hover,#drop.over{border-color:var(--accent);background:#faf5ee}
+  #drop .big{font-size:15px;margin-bottom:6px}
+  #drop .small{color:var(--muted);font-size:12.5px}
+  /* 表单 */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px 14px;margin-top:14px}
+  label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:4px}
+  input,select{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;
+               font-size:13px;background:#fff;color:var(--ink)}
+  input:focus,select:focus{outline:2px solid #e8d9c4;border-color:var(--accent)}
+  .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+  button{font-family:inherit;font-size:13px;padding:7px 14px;border-radius:6px;cursor:pointer;
+         border:1px solid var(--line);background:#fff;color:var(--ink)}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  button.primary:hover{opacity:.9;color:#fff}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  .chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--ink)}
+  .chk input{width:auto}
+  /* 任务列表 */
+  .job{border:1px solid var(--line);border-radius:9px;padding:14px 16px;margin-bottom:12px;background:#fffdf9}
+  .job .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .job .title{font-weight:600;font-size:14.5px}
+  .badge{font-size:11.5px;padding:2px 8px;border-radius:20px;border:1px solid var(--line);color:var(--muted)}
+  .badge.queued{color:#6b6b6b}
+  .badge.running{color:var(--run);border-color:#e3cf9a;background:#fdf7e8}
+  .badge.done{color:var(--ok);border-color:#bcd9c4;background:#f0f8f2}
+  .badge.error{color:var(--err);border-color:#e6c2be;background:#fdf2f1}
+  .bar{height:6px;background:#efece5;border-radius:4px;margin:10px 0 8px;overflow:hidden}
+  .bar > i{display:block;height:100%;background:var(--accent);transition:width .4s}
+  .msg{font-size:12.5px;color:var(--muted);min-height:18px}
+  .acts{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  pre.log{margin:10px 0 0;max-height:170px;overflow:auto;background:#faf8f4;border:1px solid var(--line);
+          border-radius:6px;padding:8px 10px;font-size:11.5px;line-height:1.6;color:#5a534a;white-space:pre-wrap}
+  .empty{color:var(--muted);font-size:13px;padding:14px 0;text-align:center}
+  .hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.7}
+  .kbd{font-family:ui-monospace,Menlo,monospace;background:#f2efe8;padding:1px 5px;border-radius:4px;font-size:11.5px}
+  footer{color:var(--muted);font-size:12px;text-align:center;padding:10px 0 30px}
+</style>
+</head>
+<body>
+<header>
+  <h1>ScanLibrary</h1>
+  <span class="sub">扫描版 PDF → 可重排 EPUB · 全本地</span>
+  <span class="spacer"></span>
+  <button id="btnFolder">打开成书目录</button>
+  <span class="sub" id="ollamaState">检测中…</span>
+</header>
+
+<div class="wrap">
+  <!-- 登录卡片：未认证时唯一可见 -->
+  <div class="card" id="loginCard" style="display:none;max-width:460px;margin:60px auto">
+    <h2>登录 ScanLibrary</h2>
+    <div class="small" style="color:var(--muted);font-size:12.5px;margin-bottom:12px">
+      输入访问密码后，将自动预启动本地 OCR 大模型（glm-ocr），即可上传图书。<br>
+      长时间不使用时模型会自动卸载以节约内存。
+    </div>
+    <div class="row">
+      <input id="fPwd" type="password" placeholder="访问密码" style="flex:1;min-width:180px"
+             onkeydown="if(event.key==='Enter')doLogin()"/>
+      <button class="primary" id="btnLogin" onclick="doLogin()">登录并启动模型</button>
+    </div>
+    <div class="msg" id="loginMsg" style="margin-top:10px"></div>
+  </div>
+
+  <div id="main" style="display:none">
+  <div class="card">
+    <h2>① 上传图书</h2>
+    <div id="drop">
+      <div class="big">把扫描版 PDF 拖到这里，或点击选择文件</div>
+      <div class="small">支持多文件批量上传 · 不限文件大小 · 只存在本机，不会上传任何服务器</div>
+    </div>
+    <input type="file" id="file" accept=".pdf" multiple hidden/>
+
+    <div class="grid">
+      <div style="grid-column:1/-1">
+        <label>转换模式</label>
+        <select id="fMode">
+          <option value="test">① 测试版 —— 只转换前 10 页，快速验证效果</option>
+          <option value="full">② 全书 —— 完整转换，按时长估算（前 10 页结果自动复用）</option>
+        </select>
+      </div>
+      <div>
+        <label>书名（用于文件名与目录名，可留空用文件名）</label>
+        <input id="fTitle" placeholder="例如：万历十五年"/>
+      </div>
+      <div>
+        <label>作者</label>
+        <input id="fAuthor" placeholder="例如：黄仁宇"/>
+      </div>
+      <div>
+        <label>OCR 后端</label>
+        <select id="fBackend">
+          <option value="glm-ocr">glm-ocr（Ollama 视觉模型，推荐）</option>
+          <option value="mineru">mineru CLI（本机 MinerU，精度高）</option>
+          <option value="text-layer">直接抽文字层（非扫描件，秒出）</option>
+          <option value="stub">stub（空跑，仅验证流程）</option>
+        </select>
+      </div>
+      <div>
+        <label>OCR 模型（Ollama）</label>
+        <input id="fOcrModel" value="glm-ocr"/>
+      </div>
+      <div>
+        <label>Ollama 地址</label>
+        <input id="fOllama" value="http://localhost:11434"/>
+      </div>
+      <div>
+        <label>渲染 DPI（扫描件建议 200–300）</label>
+        <input id="fDpi" type="number" value="200" min="72" max="600"/>
+      </div>
+      <div>
+        <label>并发页数（内存小就填 1）</label>
+        <input id="fConc" type="number" value="1" min="1" max="8"/>
+      </div>
+      <div>
+        <label>页面范围（仅全书模式下可自定义，留空=全部）</label>
+        <input id="fRange" placeholder="留空处理全书" disabled/>
+      </div>
+    </div>
+
+    <div class="row">
+      <label class="chk"><input type="checkbox" id="fProof"/> 转换后用文本模型校对（慢，但错字更少）</label>
+      <input id="fProofModel" placeholder="校对模型，如 qwen14b-pro" style="max-width:230px"/>
+      <label class="chk"><input type="checkbox" id="fForce"/> 忽略已有进度，全部重跑</label>
+    </div>
+    <div class="hint" id="modeHint">
+      当前为测试版模式：只转换前 10 页生成「试读版 EPUB」，验证 OCR 效果后再切换全书模式。
+      分页结果会缓存 —— 测试满意后跑全书时，前 10 页不会重复转换。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>② 转换任务</h2>
+    <div id="list"><div class="empty">还没有任务</div></div>
+  </div>
+  </div><!-- /#main -->
+</div>
+
+<footer>ScanLibrary · 所有处理都在本机完成 · <span class="kbd">Ctrl+C</span> 停止服务</footer>
+
+<script>
+const $ = s => document.querySelector(s);
+const listEl = $("#list");
+const jobs = new Map();
+let TOKEN = localStorage.getItem("sl_token") || "";
+
+// ---- 统一带认证的请求封装：401 自动弹登录框 ----
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({}, opts.headers, TOKEN ? {Authorization: "Bearer " + TOKEN} : {});
+  const r = await fetch(path, opts);
+  if (r.status === 401) { showLogin(); throw new Error("unauthorized"); }
+  return r;
+}
+
+function showLogin(){
+  TOKEN = ""; localStorage.removeItem("sl_token");
+  $("#loginCard").style.display = "";
+  $("#main").style.display = "none";
+}
+function showMain(){
+  $("#loginCard").style.display = "none";
+  $("#main").style.display = "";
+}
+async function doLogin(){
+  const btn = $("#btnLogin"); btn.disabled = true;
+  $("#loginMsg").textContent = "验证密码并预启动模型（首次加载约需十几秒）…";
+  try{
+    const r = await fetch("/api/login", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({password: $("#fPwd").value})
+    });
+    const d = await r.json();
+    if(d.ok){
+      TOKEN = d.token; localStorage.setItem("sl_token", TOKEN);
+      $("#fPwd").value = ""; $("#loginMsg").textContent = "";
+      showMain(); refresh(); checkOllama(); checkModelState();
+    }else{
+      $("#loginMsg").textContent = d.error || "密码错误";
+    }
+  }catch(e){ $("#loginMsg").textContent = "服务未响应"; }
+  btn.disabled = false;
+}
+
+$("#drop").onclick = () => $("#file").click();
+$("#drop").ondragover = e => { e.preventDefault(); $("#drop").classList.add("over"); };
+$("#drop").ondragleave = () => $("#drop").classList.remove("over");
+$("#drop").ondrop = e => {
+  e.preventDefault(); $("#drop").classList.remove("over");
+  [...e.dataTransfer.files].forEach(f => upload(f));
+};
+$("#file").onchange = e => { [...e.target.files].forEach(f => upload(f)); e.target.value=""; };
+$("#btnFolder").onclick = () => api("/api/open-folder").then(()=>{}).catch(()=>{});
+
+// ---- 模式切换 ----
+$("#fMode").onchange = () => {
+  const test = $("#fMode").value === "test";
+  $("#fRange").disabled = test;
+  if(test){
+    $("#fRange").value = "";
+    $("#modeHint").textContent = "当前为测试版模式：只转换前 10 页生成「试读版 EPUB」，验证 OCR 效果后再切换全书模式。分页结果会缓存 —— 测试满意后跑全书时，前 10 页不会重复转换。";
+  }else{
+    $("#modeHint").textContent = "当前为全书模式：完整转换整本书。上传后任务卡片会显示基于历史速度的预计耗时；无历史数据时给出参考区间。";
+  }
+};
+
+function parseRange(){
+  const v = $("#fRange").value.trim();
+  const m = v.match(/^(\d+)\s*-\s*(\d+)$/);
+  return m ? [parseInt(m[1]), parseInt(m[2])] : v.match(/^\d+$/) ? [parseInt(v), parseInt(v)] : null;
+}
+
+function config(){
+  return {
+    mode: $("#fMode").value,
+    backend: $("#fBackend").value,
+    ocr_model: $("#fOcrModel").value.trim() || "glm-ocr",
+    ollama_url: $("#fOllama").value.trim() || "http://localhost:11434",
+    dpi: parseInt($("#fDpi").value) || 200,
+    concurrency: parseInt($("#fConc").value) || 1,
+    page_range: $("#fMode").value === "test" ? [1, 10] : parseRange(),
+    proofread: $("#fProof").checked,
+    proof_model: $("#fProofModel").value.trim(),
+    force_reocr: $("#fForce").checked,
+    lang: "zh-CN",
+    num_ctx: 16384,
+  };
+}
+
+function upload(file){
+  if(!/\.pdf$/i.test(file.name)){ alert("目前只支持 PDF：" + file.name); return; }
+  const useFileTitle = jobs.size > 0 || !$("#fTitle").value.trim();
+  const title = (useFileTitle ? "" : $("#fTitle").value.trim()) || file.name.replace(/\.pdf$/i,"");
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/upload");
+  xhr.setRequestHeader("X-Filename", encodeURIComponent(file.name));
+  xhr.setRequestHeader("X-Title", encodeURIComponent(title));
+  xhr.setRequestHeader("X-Author", encodeURIComponent($("#fAuthor").value.trim()));
+  xhr.setRequestHeader("X-Config", encodeURIComponent(JSON.stringify(config())));
+  if(TOKEN) xhr.setRequestHeader("Authorization", "Bearer " + TOKEN);
+  xhr.upload.onprogress = e => {
+    if(e.lengthComputable) note(`上传 ${file.name}：${Math.round(e.loaded/e.total*100)}%`);
+  };
+  xhr.onload = () => {
+    let r = {}; try{ r = JSON.parse(xhr.responseText); }catch(e){}
+    if(r.ok){ note(`已加入队列：${title}`); refresh(); }
+    else alert("上传失败：" + (r.error || xhr.status));
+  };
+  xhr.send(file);
+}
+
+function note(msg){ console.log(msg); }
+
+function badge(s){
+  const map = {queued:"排队中", running:"转换中", done:"已完成", error:"失败", pending:"等待"};
+  return `<span class="badge ${s}">${map[s]||s}</span>`;
+}
+
+function render(){
+  if(!jobs.size){ listEl.innerHTML = `<div class="empty">还没有任务</div>`; return; }
+  const arr = [...jobs.values()].sort((a,b)=>(b.created_at||0)-(a.created_at||0));
+  listEl.innerHTML = arr.map(j => {
+    const pct = j.progress || 0;
+    const pages = j.total_pages ? ` · ${j.total_pages} 页` : "";
+    const size = j.epub_size ? ` · ${Math.round(j.epub_size/1024)} KB` : "";
+    const chap = j.chapters ? ` · ${j.chapters} 章` : "";
+    const est = j.estimate ? `<span style="color:var(--run)">⏱ ${escapeHtml(j.estimate)}</span><br/>` : "";
+    return `
+      <div class="job" id="job-${j.id}">
+        <div class="top">
+          <span class="title">${escapeHtml(j.title)}</span>
+          ${badge(j.status)}
+          <span class="sub" style="color:var(--muted);font-size:12px">${escapeHtml(j.filename||"")}${pages}${chap}${size}</span>
+        </div>
+        <div class="bar"><i style="width:${pct}%"></i></div>
+        ${est}<div class="msg">${escapeHtml(j.message||"")}</div>
+        <div class="acts">
+          ${j.download_url ? `<button class="primary" onclick="dl('${j.id}')">下载 EPUB</button>` : ""}
+          ${j.download_url ? `<button onclick="dlmd('${j.id}')">下载 Markdown</button>` : ""}
+          ${j.reveal_url ? `<button onclick="reveal('${j.id}')">在访达中显示</button>` : ""}
+          ${j.status==="running" ? `<button onclick="cancel('${j.id}')">取消</button>` : ""}
+          ${j.status==="error" ? `<button onclick="retry('${j.id}')">重试（续跑）</button>` : ""}
+          <button onclick="toggleLog('${j.id}')">日志</button>
+          <button onclick="del('${j.id}')">删除</button>
+        </div>
+        <pre class="log" id="log-${j.id}" style="display:none"></pre>
+      </div>`;
+  }).join("");
+}
+
+function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+async function refresh(){
+  try{
+    const r = await api("/api/jobs"); const d = await r.json();
+    d.jobs.forEach(j => {
+      const old = jobs.get(j.id);
+      jobs.set(j.id, j);
+      if(j.status==="running" || (old && old.status!=="done" && j.status==="done")) fetchLog(j.id);
+    });
+    [...jobs.keys()].forEach(k => { if(!d.jobs.find(x=>x.id===k)) jobs.delete(k); });
+    render();
+  }catch(e){ /* 未登录或服务未启动 */ }
+}
+
+async function fetchLog(id){
+  try{
+    const r = await api("/api/job/"+id); const j = await r.json();
+    const el = document.getElementById("log-"+id);
+    if(el) el.textContent = (j.log||[]).join("\n");
+  }catch(e){}
+}
+
+function toggleLog(id){
+  const el = document.getElementById("log-"+id);
+  if(!el) return;
+  const show = el.style.display === "none";
+  el.style.display = show ? "block" : "none";
+  if(show) fetchLog(id);
+}
+
+// ---- 下载走 blob（可携带认证头，支持中文文件名）----
+async function dlFile(url, name){
+  try{
+    const r = await api(url);
+    if(!r.ok) return;
+    const b = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b); a.download = name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 60000);
+  }catch(e){}
+}
+function dl(id){ const j = jobs.get(id); dlFile("/api/download/"+id, (j?j.title:"book")+".epub"); }
+function dlmd(id){ const j = jobs.get(id); dlFile("/api/download-md/"+id, (j?j.title:"book")+".md"); }
+function reveal(id){ api("/api/reveal/"+id).catch(()=>{}); }
+function cancel(id){ api("/api/cancel/"+id).catch(()=>{}); refresh(); }
+function retry(id){ api("/api/retry/"+id).catch(()=>{}); setTimeout(refresh,300); }
+function del(id){ if(confirm("删除该任务及其产物？")) { api("/api/delete/"+id).catch(()=>{}); jobs.delete(id); render(); } }
+
+async function checkOllama(){
+  if(!TOKEN) return;
+  try{
+    const r = await api("/api/models"); const d = await r.json();
+    if(!d.ok){ $("#ollamaState").textContent = "Ollama 未连接"; return; }
+    const has = d.models.some(m => m.startsWith("glm-ocr"));
+    if(!has){ $("#ollamaState").textContent = "Ollama 已连接 · 缺少 glm-ocr，请执行 ollama pull glm-ocr"; return; }
+    const st = await checkModelState();
+  }catch(e){ $("#ollamaState").textContent = "服务未响应"; }
+}
+
+async function checkModelState(){
+  if(!TOKEN) return;
+  try{
+    const r = await api("/api/model-state"); const d = await r.json();
+    const loaded = (d.loaded||[]).map(m=>m.split(":")[0]);
+    const cur = $("#ollamaState").textContent;
+    const base = cur.split(" · ")[0];
+    if(loaded.includes("glm-ocr")) $("#ollamaState").textContent = base + " · glm-ocr 已载入内存";
+    else $("#ollamaState").textContent = base + " · 模型未载入（首次处理时自动加载）";
+  }catch(e){}
+}
+
+// ---- 初始化：有 token 则直接进入主界面，否则显示登录 ----
+(async function init(){
+  if(!TOKEN){ showLogin(); return; }
+  try{
+    const r = await api("/api/jobs");
+    if(r.status === 401) return;
+    showMain(); refresh(); checkOllama();
+  }catch(e){ /* 已弹登录 */ }
+})();
+
+setInterval(() => {
+  if(!TOKEN) return;
+  refresh();
+  if(Math.floor(Date.now()/2000) % 15 === 0) checkModelState();
+}, 2000);
+</script>
+</body>
+</html>
