@@ -1,8 +1,10 @@
-# ScanLibrary 只有一个硬依赖：把 PDF 页渲染成图片
-pymupdf>=1.24
+# ScanLibrary 硬依赖
+pymupdf>=1.24          # PDF → 图片
+Pillow>=10.0           # paddle-layout 后端：版面分析后裁剪文字/插图区域
 
 # 说明：
 #  - Ollama 请以桌面版或 `brew install ollama` 单独安装，不在 Python 依赖里。
 #  - OCR 视觉模型：ollama pull glm-ocr        （约 2.2GB，只需一次）
 #  - 可选后端 MinerU：uv pip install -U "mineru[core,mlx]"（M 芯片 Mac）
+#  - 可选后端 paddle-layout：需本机有 PaddleOCR 3.x（用环境变量 SCANLIBRARY_PADDLE_VENV 指向 venv 的 python3）
 #  - 本程序自带 EPUB 打包，不需要 pandoc / Calibre。

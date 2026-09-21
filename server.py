@@ -8,8 +8,12 @@ ScanLibrary —— 本地扫描书 → 可重排 EPUB 工作台
   2. 一条命令启动浏览器页面：上传 PDF → 后台转换 → 自动落到 books/<书名>/ 目录 → 页面直接下载。
   3. 断点续跑：每一页的 OCR 结果单独落盘，中断后重跑自动跳过已完成页。
 
-依赖（仅一个）：pip install pymupdf      # 用于把 PDF 页渲染成图片
+依赖：pip install pymupdf Pillow
+  - pymupdf：把 PDF 页渲染成图片
+  - Pillow  ：paddle-layout 后端用：版面分析后裁剪文字/插图区域
 可选：系统装 pandoc（仅在使用 pandoc 打包后端时需要，默认不用）
+
+另外，后端 "paddle-layout" 需要本机有 PaddleOCR 3.x（通过 SCANLIBRARY_PADDLE_VENV 环境变量指定 venv 中的 python3 路径）。
 
 启动：
     python3 server.py                 # 默认 http://127.0.0.1:8765
@@ -35,6 +39,12 @@ import zipfile
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+try:
+    from PIL import Image  # paddle-layout 后端用：版面分析后裁剪文字/插图区域
+except ImportError:
+    Image = None  # 其他后端不依赖 PIL
+
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, build_opener, ProxyHandler
 
@@ -64,6 +74,20 @@ STATS_FILE: Path = None     # 历史每页耗时统计（用于全书时长估�
 PASSWORD = [None]           # 当前密码（--password 或 auth.json）
 OCR_FAIL_TAG = "【OCR-FAILED】"  # 失败页缓存标记：重跑时识别并重新 OCR
 NO_TEXT_TOKEN = "〔无文字〕"
+
+# ---- PP-DocLayout_plus-L 类别映射（仅 paddle-layout 后端使用）----
+# 丢弃：规则化移除，永远不进正文
+PADDLE_DROP_LABELS = frozenset({"header", "footer", "page_number", "footnote", "footnote_content", "seal"})
+# 嵌入：保留为 jpg 图，markdown 引用
+PADDLE_FIGURE_LABELS = frozenset({"figure", "chart"})
+# 资产图：表格/公式以图片形式嵌入（不强求 OCR 还原复杂排版）
+PADDLE_ASSET_LABELS = frozenset({"table", "formula", "equation"})
+# 文本：裁剪后调 glm-ocr
+PADDLE_TEXT_LABELS = frozenset({
+    "text", "doc_title", "paragraph_title", "reference_title",
+    "figure_title", "table_title", "reference_content", "reference",
+    "abstract", "algorithm", "catalogue",
+})
 TOKENS: dict = {}           # token -> 过期时间戳
 LAST_ACTIVITY = [time.time()]  # 最后一次已认证请求时间
 IDLE_MINUTES = 30           # 空闲超过该分钟数且无任务时：清登录态+卸载模型
@@ -638,6 +662,8 @@ def ocr_page_backend(cfg, img_path: Path) -> str:
     backend = cfg.get("backend", "glm-ocr")
     if backend == "stub":
         return clean_page_text(ocr_page_stub(cfg, img_path, 1))
+    if backend == "paddle-layout":
+        return clean_page_text(ocr_page_paddle_glm(cfg, img_path))
     return clean_page_text(ocr_page_with_fallback(cfg, img_path))
 
 
@@ -674,6 +700,123 @@ def ocr_page_with_fallback(cfg, img_path: Path) -> str:
     raise RuntimeError("；".join(errors[-4:]) or "OCR 失败")
 
 
+# =====================================================================
+# 后端 C：PP-DocLayout 版面分析 + glm-ocr 分工识别
+# =====================================================================
+def _find_paddle_venv_python() -> str:
+    """查找含 paddleocr 的 venv python3 路径。
+    优先使用 SCANLIBRARY_PADDLE_VENV 环境变量；否则扫描
+    ~/superstar/superstar3.1/projects/*/venv/bin/python3。
+    """
+    env = os.environ.get("SCANLIBRARY_PADDLE_VENV")
+    if env and Path(env).exists():
+        return env
+    base = Path.home() / "superstar" / "superstar3.1" / "projects"
+    if base.exists():
+        for venv in base.glob("*/venv/bin/python3"):
+            try:
+                r = subprocess.run([str(venv), "-c", "import paddleocr"],
+                                    capture_output=True, text=True, timeout=8)
+                if r.returncode == 0:
+                    return str(venv)
+            except Exception:
+                continue
+    return None
+
+
+def paddle_layout_detect(img_path: Path):
+    """调子进程跑 PP-DocLayout 版面检测，返回 box 列表 [{label, score, bbox}]。
+    失败抛 RuntimeError 让上层记日志并跳过。
+    """
+    py = _find_paddle_venv_python()
+    if not py:
+        raise RuntimeError(
+            "未找到 PaddleOCR venv。请安装 paddleocr 3.x，或设置 SCANLIBRARY_PADDLE_VENV=/path/to/venv/bin/python3"
+        )
+    worker = Path(__file__).resolve().parent / "paddle_layout_worker.py"
+    if not worker.exists():
+        raise RuntimeError(f"paddle_layout_worker.py 不存在: {worker}")
+    proc = subprocess.run([py, str(worker), str(img_path)],
+                            capture_output=True, text=True, timeout=180)
+    if proc.returncode != 0:
+        raise RuntimeError(f"paddle_layout 子进程失败: exit={proc.returncode}, stderr={proc.stderr[-500:]}")
+    out = proc.stdout.strip().splitlines()
+    if not out:
+        return []
+    return json.loads(out[-1])
+
+
+def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
+    """PP-Structure 版面分析 + glm-ocr 文本识别。
+    流程：
+      1) PaddleOCR 检测版面区域
+      2) 丢弃 header/footer/page_number/footnote/seal（规则化）
+      3) text/title 类: 裁剪后调 glm-ocr
+      4) figure 类: 保留为 jpg，markdown 引用（图区不 OCR）
+      5) table/formula: 保留为 jpg（不强求 OCR 还原复杂排版）
+      6) 按阅读顺序拼接（自上而下，自左而右）
+    """
+    if Image is None:
+        return NO_TEXT_TOKEN
+    try:
+        boxes = paddle_layout_detect(img_path)
+    except Exception as e:
+        return f"（版面分析失败：{e}）"
+    if not boxes:
+        return NO_TEXT_TOKEN
+
+    img = Image.open(img_path).convert("RGB")
+    W, H = img.size
+    parts = []
+    for idx, b in enumerate(boxes):
+        label = b.get("label", "")
+        try:
+            x1, y1, x2, y2 = (int(round(c)) for c in b["bbox"])
+        except Exception:
+            continue
+        x1 = max(0, min(x1, W - 1)); x2 = max(0, min(x2, W))
+        y1 = max(0, min(y1, H - 1)); y2 = max(0, min(y2, H))
+        if x2 - x1 < 16 or y2 - y1 < 16:
+            continue
+        if label in PADDLE_DROP_LABELS:
+            continue
+
+        crop = img.crop((x1, y1, x2, y2))
+        base_stem = f"{img_path.stem}_p{idx}"
+
+        if label in PADDLE_FIGURE_LABELS:
+            fig_path = img_path.parent / f"{base_stem}.jpg"
+            try:
+                crop.save(fig_path, "JPEG", quality=85)
+                parts.append((y1, x1, f"![插图]({fig_path.name})"))
+            except Exception:
+                pass
+            continue
+        if label in PADDLE_ASSET_LABELS:
+            asset_path = img_path.parent / f"{base_stem}_{label}.jpg"
+            try:
+                crop.save(asset_path, "JPEG", quality=90)
+                parts.append((y1, x1, f"![{label}]({asset_path.name})"))
+            except Exception:
+                pass
+            continue
+        # 文本类（含未知 label）：裁剪后调 glm-ocr
+        tmp_path = img_path.parent / f"{base_stem}_crop.jpg"
+        try:
+            crop.save(tmp_path, "JPEG", quality=92)
+            txt = clean_page_text(ocr_page_glmocr(cfg, tmp_path, attempt=1))
+            if txt and txt != NO_TEXT_TOKEN:
+                parts.append((y1, x1, txt))
+        except Exception:
+            pass
+        finally:
+            try: tmp_path.unlink()
+            except Exception: pass
+
+    parts.sort(key=lambda p: (p[0], p[1]))
+    return "\n\n".join(p[2] for p in parts) if parts else NO_TEXT_TOKEN
+
+
 def run_mineru(cfg, pdf_path: Path, work_dir: Path):
     """后端 B：调用本机 mineru CLI（Mac 上常用 -b pipeline -d mps）。"""
     out_dir = work_dir / "mineru_out"
@@ -706,8 +849,11 @@ CJK = r"\u4e00-\u9fff\u3040-\u30ff"
 
 
 def clean_page_text(text):
-    """去掉模型输出的代码围栏与常见噪声行。"""
-    text = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", text.strip())
+    """去掉模型输出的所有代码围栏行（保留内部正文）与多余空行。
+    glm-ocr 在裁剪图上常重复输出 ``` 行（无内容），必须去掉。
+    """
+    text = re.sub(r"```[^\n]*\n?", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     text = text.replace("\r\n", "\n")
     return text.strip()
 

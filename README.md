@@ -32,13 +32,22 @@ ScanLibrary 是一个**单机扫描书数字化工作台**：浏览器里拖入 
 - 任务可**取消**、失败可**重试（续跑）**、可**删除**（连同产物）
 - 每个任务带**日志面板**，可在页面上直接看后端流水日志
 
-### 2. 四种 OCR 后端
+### 2. 五种 OCR 后端
 | 后端 | 说明 |
 |---|---|
 | `glm-ocr` | 默认。调 Ollama 视觉模型逐页 OCR，本地小模型、免费用 |
+| `paddle-layout` | **最稳的扫描件方案**：PaddleOCR PP-DocLayout 做版面分析（识别正文/图/页眉页脚/页码/印章），文字区裁剪后调 glm-ocr 识别，图区保留为插图。500 风险近乎为零、插图保留、页眉页脚/页码规则化剥离 |
 | `mineru` | 调本机 MinerU CLI（需自行安装），中文精度更高，产物为 Markdown 后由本程序接手切章打包 |
 | `text-layer` | 直接抽取 PDF 自带文字层，**秒出、不需要任何模型**；适合本来就带文字层的"伪扫描件" |
 | `stub` | 空跑占位，只验证整条流水线，不烧算力 |
+
+**关于 `paddle-layout` 后端**
+
+- 需本机已装 PaddleOCR 3.x（CPU 即可），并指明其 venv 的 python3 路径
+- 设置环境变量 `SCANLIBRARY_PADDLE_VENV=/path/to/venv/bin/python3`；未设置时会自动扫描 `~/superstar/superstar3.1/projects/*/venv/bin/python3`
+- 首次跑会自动下载 `PP-DocLayout_plus-L` 模型（~123MB，存到 modelscope 缓存）
+- **何时用它**：看到 glm-ocr 频繁 500、插图消失、页眉页脚混进正文时换它；古籍竖排、混排图文的书首选它
+- 完整流程：每页先由 PP-DocLayout 标出区域 → 文字区裁剪后给 glm-ocr（单张图通常只有页面的 1/4~1/8，几乎不会触发大图 500）→ 图区直接存为 jpg，markdown 嵌入 EPUB
 
 ### 3. OCR 稳定性与画质（踩坑后加固的部分）
 - **渲染 DPI 可调**（72–600），**并发页数可调**（内存小填 1–2）
