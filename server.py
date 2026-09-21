@@ -1019,7 +1019,7 @@ def split_chapters(text):
 # Markdown → XHTML（极简转换器，够 EPUB 用）
 # ---------------------------------------------------------------------------
 
-def inline_md(s, note_href_template="notes.xhtml#note-{id}"):
+def inline_md(s, note_href_builder=None, note_ref_id_builder=None):
     s = html.escape(s, quote=False)
     s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
     s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", s)
@@ -1028,12 +1028,10 @@ def inline_md(s, note_href_template="notes.xhtml#note-{id}"):
     def repl_note_ref(m):
         nid = m.group(1)
         label = m.group(2)
-        try:
-            href = note_href_template.format(id=nid)
-        except Exception:
-            href = f"notes.xhtml#note-{nid}"
+        href = note_href_builder(nid) if note_href_builder else f"notes.xhtml#note-{nid}"
+        ref_id = note_ref_id_builder(nid) if note_ref_id_builder else f"note-ref-{nid}"
         return (
-            f'<a id="note-ref-{nid}" epub:type="noteref" class="noteref" '
+            f'<a id="{html.escape(ref_id, quote=True)}" epub:type="noteref" class="noteref" '
             f'href="{html.escape(href, quote=True)}">{label}</a>'
         )
 
@@ -1043,7 +1041,7 @@ def inline_md(s, note_href_template="notes.xhtml#note-{id}"):
     return s
 
 
-def md_to_xhtml(md, note_href_template="notes.xhtml#note-{id}"):
+def md_to_xhtml(md, note_href_builder=None, note_ref_id_builder=None):
     lines = md.split("\n")
     out = []
     in_list = False
@@ -1053,7 +1051,10 @@ def md_to_xhtml(md, note_href_template="notes.xhtml#note-{id}"):
     def flush_para():
         nonlocal para
         if para:
-            out.append("<p>" + "<br/>".join(inline_md(l, note_href_template=note_href_template) for l in para) + "</p>")
+            out.append("<p>" + "<br/>".join(
+                inline_md(l, note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)
+                for l in para
+            ) + "</p>")
             para = []
 
     for raw in lines:
@@ -1075,12 +1076,17 @@ def md_to_xhtml(md, note_href_template="notes.xhtml#note-{id}"):
                 out.append("</ul>")
                 in_list = False
             lvl = min(6, len(m.group(1)))
-            out.append(f"<h{lvl}>{inline_md(m.group(2), note_href_template=note_href_template)}</h{lvl}>")
+            out.append(
+                f"<h{lvl}>{inline_md(m.group(2), note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)}</h{lvl}>"
+            )
             continue
         if re.match(r"^\|", s):
             flush_para()
             cells = [c.strip() for c in s.strip("|").split("|")]
-            out.append("<p>" + " ｜ ".join(inline_md(c, note_href_template=note_href_template) for c in cells) + "</p>")
+            out.append("<p>" + " ｜ ".join(
+                inline_md(c, note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)
+                for c in cells
+            ) + "</p>")
             continue
         if re.match(r"^([-*+]|\d+\.)\s+", s):
             flush_para()
@@ -1088,14 +1094,16 @@ def md_to_xhtml(md, note_href_template="notes.xhtml#note-{id}"):
                 out.append("<ul>")
                 in_list = True
             item = re.sub(r"^([-*+]|\d+\.)\s+", "", s)
-            out.append(f"<li>{inline_md(item, note_href_template=note_href_template)}</li>")
+            out.append(f"<li>{inline_md(item, note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)}</li>")
             continue
         if s.startswith(">"):
             if not in_quote:
                 flush_para()
                 out.append("<blockquote>")
                 in_quote = True
-            out.append(f"<p>{inline_md(s.lstrip('> '), note_href_template=note_href_template)}</p>")
+            out.append(
+                f"<p>{inline_md(s.lstrip('> '), note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)}</p>"
+            )
             continue
         if re.match(r"^(-{3,}|\*{3,})$", s):
             flush_para()
@@ -1163,20 +1171,36 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             body = chapter["body"]
             chapter_notes = chapter.get("notes") or []
             fname = f"chap_{i + 1:04d}.xhtml"
+            note_ref_counts = {}
+            note_backrefs = {}
+
+            def note_ref_id_builder(nid: str) -> str:
+                count = note_ref_counts.get(nid, 0) + 1
+                note_ref_counts[nid] = count
+                ref_id = f"note-ref-{nid}-{count}"
+                note_backrefs.setdefault(int(nid), []).append(ref_id)
+                return ref_id
+
             xhtml = md_to_xhtml(
                 body,
-                note_href_template=("#note-{id}" if chapter_notes else "notes.xhtml#note-{id}"),
+                note_href_builder=(lambda nid: f"#note-{nid}" if chapter_notes else f"notes.xhtml#note-{nid}"),
+                note_ref_id_builder=note_ref_id_builder,
             )
             note_html = ""
             if chapter_notes:
                 note_lines = ['<section class="chapter-notes" epub:type="endnotes">', '<h3>注释</h3>']
                 for note in chapter_notes:
                     label = html.escape(note.get("label") or f"[{note['id']}]")
-                    text = inline_md(note.get("text", ""), note_href_template="#note-{id}")
+                    text = inline_md(note.get("text", ""))
+                    backrefs = note_backrefs.get(note["id"], [])
+                    backref_html = " ".join(
+                        f'<a class="backref" aria-label="返回正文中的注释引用" href="#{html.escape(ref_id, quote=True)}">'
+                        f'返回正文{"" if idx == 1 else idx}</a>'
+                        for idx, ref_id in enumerate(backrefs, 1)
+                    )
                     note_lines.append(
                         f'<p id="note-{note["id"]}" epub:type="endnote"><strong>{label}</strong> {text}'
-                        f'<a class="backref" aria-label="返回正文中的注释引用" '
-                        f'href="#note-ref-{note["id"]}">返回正文</a></p>'
+                        f'{backref_html}</p>'
                     )
                 note_lines.append("</section>")
                 note_html = "\n".join(note_lines)
