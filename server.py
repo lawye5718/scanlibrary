@@ -483,8 +483,9 @@ def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
             body.append(para)
     body_text = "\n\n".join(body).strip()
     for note in notes:
+        label_pat = rf"(?<![A-Za-z0-9]){re.escape(note['label'])}(?![A-Za-z0-9])"
         body_text, n = re.subn(
-            re.escape(note["label"]),
+            label_pat,
             f"[[NOTE_REF:{note['id']}|{note['label']}]]",
             body_text,
             count=1,
@@ -627,6 +628,13 @@ def ocr_page_glmocr(cfg, img_path: Path, attempt: int = 1):
 def ocr_page_stub(cfg, img_path: Path, attempt: int = 1):
     """测试后端：不 OCR，生成占位文本（用于验证流水线是否跑通）。"""
     return f"（stub 模式）第 {img_path.stem} 页占位文本。\n\n这是用于验证流水线的示例段落。"
+
+
+def ocr_page_backend(cfg, img_path: Path) -> str:
+    backend = cfg.get("backend", "glm-ocr")
+    if backend == "stub":
+        return clean_page_text(ocr_page_stub(cfg, img_path, 1))
+    return clean_page_text(ocr_page_with_fallback(cfg, img_path))
 
 
 def ocr_page_with_fallback(cfg, img_path: Path) -> str:
@@ -837,7 +845,7 @@ def md_to_xhtml(md):
     def flush_para():
         nonlocal para
         if para:
-            out.append("<p>" + "".join(inline_md(l) for l in para) + "</p>")
+            out.append("<p>" + "<br/>".join(inline_md(l) for l in para) + "</p>")
             para = []
 
     for raw in lines:
@@ -1110,7 +1118,7 @@ def run_job(job_id):
             if cached:
                 log(job_id, f"复用已完成页面 {cached} 页")
 
-            ocr_fn = {"glm-ocr": ocr_page_with_fallback, "stub": ocr_page_stub}.get(backend, ocr_page_with_fallback)
+            ocr_fn = ocr_page_backend
             # Mac 上 Ollama 并发>1 会触发 llama-server 二次加载超时（HTTP 500），
             # 默认串行最稳；确有富余再手动调高
             concurrency = max(1, min(int(cfg.get("concurrency", 1)), 4))
@@ -1122,23 +1130,17 @@ def run_job(job_id):
                 if CANCEL_FLAGS.get(job_id):
                     return
                 pno, p = item
-                max_attempts = 1 if backend == "glm-ocr" else 3
-                for attempt in range(1, max_attempts + 1):
-                    try:
-                        txt = clean_page_text(ocr_fn(cfg, p)) if backend == "glm-ocr" else clean_page_text(ocr_fn(cfg, p, attempt))
-                        if not txt or is_suspicious_ocr_text(txt):
-                            raise RuntimeError("空结果")
-                        (pages_dir / f"{pno:04d}.md").write_text(txt, encoding="utf-8")
-                        with lock:
-                            page_texts[pno] = txt
-                        break
-                    except Exception as e:  # noqa
-                        if attempt == max_attempts or CANCEL_FLAGS.get(job_id):
-                            log(job_id, f"第 {pno} 页失败：{e}")
-                            (pages_dir / f"{pno:04d}.md").write_text(
-                                OCR_FAIL_TAG + f"\n{e}", encoding="utf-8")
-                        else:
-                            time.sleep(2 * attempt)
+                try:
+                    txt = ocr_fn(cfg, p)
+                    if not txt or is_suspicious_ocr_text(txt):
+                        raise RuntimeError("空结果")
+                    (pages_dir / f"{pno:04d}.md").write_text(txt, encoding="utf-8")
+                    with lock:
+                        page_texts[pno] = txt
+                except Exception as e:  # noqa
+                    log(job_id, f"第 {pno} 页失败：{e}")
+                    (pages_dir / f"{pno:04d}.md").write_text(
+                        OCR_FAIL_TAG + f"\n{e}", encoding="utf-8")
                 with lock:
                     done[0] += 1
                     n = done[0]
@@ -1243,14 +1245,17 @@ def run_job(job_id):
             idx = len(chapters) + 1
             fname = f"chap_{idx:04d}.xhtml"
             for note in chapter_notes:
-                note["chapter_href"] = fname
+                note.setdefault("chapter_href", fname)
             chapters.append({
                 "title": title0,
                 "body": body_with_refs,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
             })
         if not chapters:
-            chapters = [{"title": "正文", "body": render_note_refs_as_text(full), "illustration_only": False}]
+            body_with_refs, chapter_notes = note_refs_for_epub(full, all_notes)
+            for note in chapter_notes:
+                note.setdefault("chapter_href", "chap_0001.xhtml")
+            chapters = [{"title": "正文", "body": body_with_refs, "illustration_only": False}]
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
