@@ -1009,21 +1009,26 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
         label = b.get("label", "")
         kind = _layout_label_kind(label)
         drop = False
+        retained = []
         for k in kept:
             overlap = _bbox_iou(bb, k["bbox"]) >= iou_thr or _bbox_cover(k["bbox"], bb) >= cover_thr
             if not overlap:
+                retained.append(k)
                 continue
             kept_label = k.get("label", "")
             kept_kind = _layout_label_kind(kept_label)
             if kind == "visual" and kept_kind != "visual":
                 continue
             if kept_kind == "visual" and kind != "visual":
+                retained.append(k)
                 continue
             if _layout_label_priority(kept_label) >= _layout_label_priority(label):
                 drop = True
                 break
+            retained.append(k)
         if drop:
             continue
+        kept = retained
         kept.append(b)
     return kept
 
