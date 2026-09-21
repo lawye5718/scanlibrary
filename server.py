@@ -520,21 +520,17 @@ def render_note_refs_as_text(text: str) -> str:
     return NOTE_REF_RE.sub(lambda m: m.group(2), text or "")
 
 
-def note_refs_for_epub(text: str, notes: list[dict]) -> tuple[str, list[dict]]:
+def collect_note_refs_for_epub(text: str, notes: list[dict]) -> list[dict]:
     by_id = {n["id"]: n for n in notes}
     chapter_notes = []
     seen = set()
-
-    def repl(m):
+    for m in NOTE_REF_RE.finditer(text or ""):
         nid = int(m.group(1))
-        label = m.group(2)
         note = by_id.get(nid)
         if note and nid not in seen:
             chapter_notes.append(note)
             seen.add(nid)
-        return f"[[NOTE_REF:{nid}|{label}]]"
-
-    return NOTE_REF_RE.sub(repl, text or ""), chapter_notes
+    return chapter_notes
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +988,7 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                 note_lines.append(
                     f'<p id="note-{note["id"]}"><strong>{label}</strong> {text}'
                     f'<a class="backref" aria-label="返回正文中的注释引用" '
-                    f'href="{chapter_href}#note-ref-{note["id"]}">返回正文</a></p>'
+                    f'href="{chapter_href}#note-ref-{note["id"]}">返回正文（{label}）</a></p>'
                 )
             note_lines += ['</body>', '</html>', '']
             z.writestr("OEBPS/notes.xhtml", "\n".join(note_lines))
@@ -1247,6 +1243,7 @@ def run_job(job_id):
                 if notes_md:
                     proofread_md = proofread_md.rstrip() + "\n\n" + notes_md + "\n"
                 (book_dir / "book.proofread.md").write_text(proofread_md, encoding="utf-8")
+                book_md = proofread_md
 
         # ---- 5. 切章 + 打包 EPUB ----
         log(job_id, "切分章节并生成 EPUB")
@@ -1255,7 +1252,7 @@ def run_job(job_id):
         epub_notes = []
         epub_note_ids = set()
         for title0, body0 in raw_chapters:
-            body_with_refs, chapter_notes = note_refs_for_epub(body0, all_notes)
+            chapter_notes = collect_note_refs_for_epub(body0, all_notes)
             idx = len(chapters) + 1
             fname = f"chap_{idx:04d}.xhtml"
             for note in chapter_notes:
@@ -1264,18 +1261,18 @@ def run_job(job_id):
                     epub_note_ids.add(note["id"])
             chapters.append({
                 "title": title0,
-                "body": body_with_refs,
+                "body": body0,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
             })
         if not chapters:
-            body_with_refs, chapter_notes = note_refs_for_epub(full, all_notes)
+            chapter_notes = collect_note_refs_for_epub(full, all_notes)
             for note in chapter_notes:
                 if note["id"] not in epub_note_ids:
                     epub_notes.append({**note, "chapter_href": "chap_0001.xhtml"})
                     epub_note_ids.add(note["id"])
             chapters = [{
                 "title": "正文",
-                "body": body_with_refs,
+                "body": full,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
             }]
         # 测试版单独命名，不覆盖全书版 EPUB
