@@ -146,13 +146,36 @@
     </div>
 
     <div class="row">
-      <label class="chk"><input type="checkbox" id="fProof" checked/> 转换后用文本模型校对（慢，但错字更少）</label>
-      <input id="fProofModel" value="qwen14b-pro" placeholder="校对模型，如 qwen14b-pro" style="max-width:230px"/>
+      <label class="chk"><input type="checkbox" id="fProof"/> 转换完成后立即用千问校对（慢；不勾选则直接出 EPUB，最快）</label>
       <label class="chk"><input type="checkbox" id="fForce"/> 忽略已有进度，全部重跑</label>
+    </div>
+    <div class="hint">
+      不勾校对时：转换一结束就打包 EPUB，不做任何大模型校对，速度最快。
+      想校对随时可在下方「③ 单独校对」里对已完成的成书补做，不影响原始产出。
     </div>
     <div class="hint" id="modeHint">
       当前为测试版模式：只转换前 10 页生成「试读版 EPUB」，验证 OCR 效果后再切换全书模式。
       分页结果会缓存 —— 测试满意后跑全书时，前 10 页不会重复转换。
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>③ 单独校对（对已完成的成书补做千问校对）</h2>
+    <div class="hint">
+      在下方任务卡片点「开始校对」，系统会以成书正文为起点重跑一遍千问校对、按校对后正文重建 EPUB，
+      并生成<b>校对对照表</b>——逐处列出「原文 → 改为」，标出建议重点核对的增删/大段改写，供你人工确认。<br/>
+      校对前会自动把过程文件备份到成书目录的 <span class="kbd">backup/</span> 下，不满意可点「回退到校对前」一键还原（保留最近 3 份）。
+    </div>
+    <div class="row">
+      <label class="chk">校对模型
+        <input id="fProofModel" value="qwen14b-pro" placeholder="如 qwen14b-pro" style="max-width:220px"/>
+      </label>
+      <label class="chk">分块字数
+        <input id="fProofChunk" type="number" value="700" min="200" max="2000" style="max-width:110px"/>
+      </label>
+      <span class="sub" style="color:var(--muted);font-size:12px">
+        分块越小越稳但越慢；700 字左右在 14B 模型上表现最好。
+      </span>
     </div>
   </div>
 
@@ -246,7 +269,8 @@ function config(){
     concurrency: parseInt($("#fConc").value) || 1,
     page_range: $("#fMode").value === "test" ? [1, 10] : parseRange(),
     proofread: $("#fProof").checked,
-    proof_model: $("#fProofModel").value.trim(),
+    proof_model: $("#fProofModel").value.trim() || "qwen14b-pro",
+    proof_chunk_chars: parseInt($("#fProofChunk").value) || 700,
     force_reocr: $("#fForce").checked,
     lang: "zh-CN",
     num_ctx: 16384,
@@ -291,6 +315,13 @@ function render(){
     const size = j.epub_size ? ` · ${Math.round(j.epub_size/1024)} KB` : "";
     const chap = j.chapters ? ` · ${j.chapters} 章` : "";
     const est = j.estimate ? `<span style="color:var(--run)">⏱ ${escapeHtml(j.estimate)}</span><br/>` : "";
+    const pf = j.proofread
+      ? `<div class="msg">校对：${escapeHtml(j.proofread.model||"")} · ${j.proofread.blocks||0} 块 · 改动 ${j.proofread.edits||0} 处 · 回退 ${j.proofread.fallback||0} 块</div>`
+      : "";
+    const bk = j.backup_count
+      ? `<div class="msg">可回退备份 ${escapeHtml(j.latest_backup||"")}${
+           j.backup_note ? "（"+escapeHtml(j.backup_note)+"）" : ""} · 共 ${j.backup_count} 份</div>`
+      : "";
     return `
       <div class="job" id="job-${j.id}">
         <div class="top">
@@ -299,11 +330,16 @@ function render(){
           <span class="sub" style="color:var(--muted);font-size:12px">${escapeHtml(j.filename||"")}${pages}${chap}${size}</span>
         </div>
         <div class="bar"><i style="width:${pct}%"></i></div>
-        ${est}<div class="msg">${escapeHtml(j.message||"")}</div>
+        ${est}${pf}${bk}<div class="msg">${escapeHtml(j.message||"")}</div>
         <div class="acts">
           ${j.download_url ? `<button class="primary" onclick="dl('${j.id}')">下载 EPUB</button>` : ""}
           ${j.download_url ? `<button onclick="dlmd('${j.id}')">下载 Markdown</button>` : ""}
           ${j.reveal_url ? `<button onclick="reveal('${j.id}')">在访达中显示</button>` : ""}
+          ${j.has_report ? `<button onclick="openReport('${j.id}')">校对对照表</button>` : ""}
+          ${j.has_report ? `<button onclick="dlFile('/api/report-md/${j.id}', '校对对照表.md')">对照表 MD</button>` : ""}
+          ${j.can_proofread && j.status!=="running" && j.status!=="queued"
+             ? `<button class="primary" onclick="startProof('${j.id}')">${j.proofread_done?"重新校对":"开始校对"}</button>` : ""}
+          ${j.backup_count && j.status!=="running" ? `<button onclick="rollback('${j.id}')">回退到校对前</button>` : ""}
           ${j.status==="running" ? `<button onclick="cancel('${j.id}')">取消</button>` : ""}
           ${j.status==="error" ? `<button onclick="retry('${j.id}')">重试（续跑）</button>` : ""}
           <button onclick="toggleLog('${j.id}')">日志</button>
@@ -361,6 +397,54 @@ function dlmd(id){ const j = jobs.get(id); dlFile("/api/download-md/"+id, (j?j.t
 function reveal(id){ api("/api/reveal/"+id).catch(()=>{}); }
 function cancel(id){ api("/api/cancel/"+id).catch(()=>{}); refresh(); }
 function retry(id){ api("/api/retry/"+id).catch(()=>{}); setTimeout(refresh,300); }
+
+// ---- 单独校对：以成书正文重跑千问校对并重建 EPUB（校对前自动备份）----
+async function startProof(id){
+  const j = jobs.get(id) || {};
+  const model = ($("#fProofModel").value || "").trim() || "qwen14b-pro";
+  const chunk = parseInt($("#fProofChunk").value) || 700;
+  if(!confirm(`用「${model}」对《${j.title||""}》重跑校对并重建 EPUB？\n\n`
+    + `· 校对前会把过程文件备份到 backup/，不满意可一键回退\n`
+    + `· 每 ${chunk} 字一块，很慢（每块约十几秒），中途可取消\n\n开始？`)) return;
+  try{
+    const r = await api("/api/proofread/"+id, {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({model, proof_chunk_chars: chunk})});
+    const d = await r.json();
+    if(!d.ok) alert(d.error || "启动失败");
+    setTimeout(refresh, 300);
+  }catch(e){ alert("服务未响应"); }
+}
+
+// ---- 一键回退到校对前 ----
+async function rollback(id){
+  const j = jobs.get(id) || {};
+  if(!confirm(`把《${j.title||""}》回退到校对前？\n\n`
+    + `将恢复备份的过程文件、删除本次校对产物与对照表，并按恢复后的正文重建 EPUB。`)) return;
+  try{
+    const r = await api("/api/rollback/"+id, {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({backup:"latest"})});
+    const d = await r.json();
+    if(d.ok){
+      const rb = d.rollback || {};
+      alert(`已回退到备份 ${rb.tag}\n恢复：${(rb.restored||[]).join("、")||"无"}`
+        + `\n删除：${(rb.removed||[]).join("、")||"无"}`);
+      refresh();
+    }else alert(d.error || "回退失败");
+  }catch(e){ alert("服务未响应"); }
+}
+
+// ---- 打开校对对照表（先同步开窗，避免被弹窗拦截）----
+async function openReport(id){
+  const w = window.open("", "_blank");
+  if(!w){ alert("浏览器拦截了新窗口，请允许本站弹窗后重试"); return; }
+  w.document.write("<p style='font:14px sans-serif;padding:24px'>正在载入校对对照表…</p>");
+  try{
+    const r = await api("/api/report/"+id);
+    if(!r.ok){ w.document.write("<p style='font:14px sans-serif;padding:24px'>对照表不存在</p>"); return; }
+    w.document.open(); w.document.write(await r.text()); w.document.close();
+  }catch(e){ w.document.write("<p style='font:14px sans-serif;padding:24px'>服务未响应</p>"); }
+}
 function del(id){ if(confirm("删除该任务及其产物？")) { api("/api/delete/"+id).catch(()=>{}); jobs.delete(id); render(); } }
 
 async function checkOllama(){

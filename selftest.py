@@ -267,6 +267,159 @@ jobs = json.loads(get("/api/jobs"))["jobs"]
 assert isinstance(jobs, list) and len(jobs) == 2
 print("✅ 任务列表 OK")
 
+# ==================== 校对：对照表 / 备份回退 / 单独校对 ====================
+print("\n===== 校对链路 =====")
+pr = server.pr
+
+# --- 1. 改动比对与对照表渲染 ---
+assert ("巳", "已") in pr.change_pairs("他巳经到此。", "他已经到此。")
+assert pr.change_pairs("完全相同", "完全相同") == []
+assert pr.classify_change("巳", "已")[0] == "错字"
+assert pr.classify_change("", "新增了一句")[1] == "warn"
+assert pr.classify_change("，", "。")[0] == "标点"
+assert pr.classify_change("很长的一段旧文本内容", "完全不同的一段新文本")[0] == "大段改写"
+
+recs = [
+    {"i": 1, "total": 2, "status": "ok", "reason": "", "orig": "他巳经到此。", "fixed": "他已经到此。"},
+    {"i": 2, "total": 2, "status": "ok", "reason": "", "orig": "甲未末。", "fixed": "甲未末。。"},
+]
+agg = pr.summarize_changes(recs)
+assert {a["old"] for a in agg} == {"巳", ""}, agg
+assert agg[0]["level"] == "warn", "增补应排在最前（风险优先）"
+assert next(a for a in agg if a["old"] == "巳")["count"] == 1
+assert pr.summarize_changes([{"i": 1, "total": 1, "status": "fallback", "reason": "x",
+                              "orig": "甲", "fixed": "乙"}]) == [], "回退块不列入对照表"
+
+news = {"model": "fake", "total": 2, "n_ok": 2, "n_fallback": 0, "n_changed": 2}
+assert "改动明细" in pr.render_report_html("测试", recs, news)
+assert "巳" in pr.render_report_md("测试", recs, news)
+assert "<del>" in pr.render_report_html("测试", recs, news), "应高亮原文被删改处"
+print("✅ 对照表渲染（改动聚合/风险排序/回退块排除/高亮）")
+
+# --- 2. 备份 / 回退 / 只留最近 N 份 ---
+tb = ROOT / "books" / "_校对备份测试"
+shutil.rmtree(tb, ignore_errors=True)
+tb.mkdir(parents=True)
+(tb / "book.md").write_text("原始正文", encoding="utf-8")
+(tb / "book.source.md").write_text("原始正文", encoding="utf-8")
+(tb / "notes.json").write_text("[]", encoding="utf-8")
+(tb / "测试书名.epub").write_bytes(b"PK-old")
+
+snap = pr.backup_artifacts(tb, note="测试备份")
+assert snap.is_dir() and (snap / "book.md").read_text(encoding="utf-8") == "原始正文"
+assert (snap / "测试书名.epub").read_bytes() == b"PK-old", "EPUB 也要进快照"
+assert pr.list_backups(tb)[0]["note"] == "测试备份"
+
+(tb / "book.md").write_text("被校对改过的正文", encoding="utf-8")
+(tb / "book.proofread.md").write_text("校对后正文", encoding="utf-8")
+pr.write_report(tb, "校对测试", recs, {"model": "fake"})
+(tb / "测试书名.epub").write_bytes(b"PK-new")
+assert (tb / "proofread-report.html").is_file()
+
+info = pr.restore_backup(tb)
+assert "book.md" in info["restored"] and "测试书名.epub" in info["restored"], info
+assert "book.proofread.md" in info["removed"] and "proofread-report.html" in info["removed"], info
+assert (tb / "book.md").read_text(encoding="utf-8") == "原始正文"
+assert (tb / "测试书名.epub").read_bytes() == b"PK-old"
+assert not (tb / "book.proofread.md").exists() and not (tb / "proofread-report.html").exists()
+
+for i in range(5):
+    pr.backup_artifacts(tb, tag=f"2020010{i}-000000")
+assert len(pr.list_backups(tb)) == pr.KEEP_BACKUPS, pr.list_backups(tb)
+print("✅ 备份/一键回退/清理旧备份")
+
+# --- 3. 校对源优先级 + 打包复用（注释要能挂回章节）---
+sd = ROOT / "books" / "_校对源测试"
+shutil.rmtree(sd, ignore_errors=True)
+(sd / "images").mkdir(parents=True)
+(sd / "book.source.md").write_text("## 第一章\n\n正文[[NOTE_REF:1|[1]]]。", encoding="utf-8")
+(sd / "notes.json").write_text(json.dumps([{"id": 1, "label": "[1]", "text": "注释内容"}]),
+                              encoding="utf-8")
+(sd / "book.md").write_text("扁平化后的正文", encoding="utf-8")
+text, notes, origin = server.load_proofread_source(sd)
+assert origin == "book.source.md" and "[[NOTE_REF:1|[1]]]" in text, origin
+assert notes and notes[0]["text"] == "注释内容"
+assert server.notes_block(notes).startswith("# 注释") and "注释内容" in server.notes_block(notes)
+
+epub2, chapters = server.build_epub_from_source(text, notes, sd, "校对源测试",
+                                                "校对源测试", "作者", {"mode": "full"})
+assert epub2.is_file() and len(chapters) == 1 and chapters[0]["notes"], chapters
+with zipfile.ZipFile(epub2) as _z:
+    _body = "".join(_z.read(n).decode("utf-8") for n in _z.namelist() if n.endswith(".xhtml"))
+assert "注释内容" in _body, "章节注释未写入 EPUB"
+(sd / "book.source.md").unlink()                # 退回到 book.md
+assert server.load_proofread_source(sd)[2].startswith("book.md")
+print("✅ 校对源优先带标记的 book.source.md，注释可挂回章节")
+
+# --- 4. 不启用校对时清掉上一轮产物 ---
+(sd / "book.proofread.md").write_text("x", encoding="utf-8")
+pr.write_report(sd, "t", recs, {})
+assert set(server.clear_proofread_products(sd)) >= {"book.proofread.md", "proofread-report.html"}
+assert not (sd / "book.proofread.md").exists() and not (sd / "proofread-report.html").exists()
+print("✅ 未勾选校对时上一轮校对产物被清理（转换走最快路径）")
+
+# --- 5. 单独校对（HTTP 全链路）：备份 → 校对 → 重建 EPUB → 对照表 → 一键回退 ---
+_keep = (server.ollama_chat_messages, server.ollama_loaded_models, server.ollama_unload)
+server.ollama_loaded_models = lambda *a, **k: []
+server.ollama_unload = lambda *a, **k: False
+server.ollama_chat_messages = (
+    lambda base, model, messages, options=None, timeout=600, keep_alive="30m":
+    messages[1]["content"].split("【本次待校对文本】\n", 1)[1].rsplit("\n\n【输出要求】", 1)[0])
+try:
+    js = json.loads(get(f"/api/job/{jid2}"))
+    bd = ROOT / "books" / js["slug"]
+    assert (bd / "book.source.md").is_file(), "转换流程应留下带标记的校对源"
+    assert (bd / "notes.json").is_file(), "转换流程应留下注释数据"
+    before_src = (bd / "book.source.md").read_text(encoding="utf-8")
+    assert js["can_proofread"] and not js["has_report"] and js["backup_count"] == 0
+
+    rp = post(f"/api/proofread/{jid2}", json.dumps({"model": "fake", "proof_chunk_chars": 300}).encode(),
+              {"Content-Type": "application/json"})
+    assert rp["ok"], rp
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        s3 = json.loads(get(f"/api/job/{jid2}"))
+        if s3["status"] == "done" and s3.get("proofread"):
+            break
+        if s3["status"] == "error":
+            raise SystemExit("❌ 单独校对失败: " + str(s3.get("error")))
+        time.sleep(0.2)
+    else:
+        raise SystemExit("❌ 单独校对超时")
+    assert s3["has_report"] and s3["backup_count"] >= 1, s3
+    assert (bd / "book.proofread.md").is_file()
+    assert (bd / "proofread-report.md").is_file() and (bd / "proofread-report.json").is_file()
+    assert s3["proofread"]["blocks"] >= 1 and s3["proofread"]["ok"] >= 1, s3["proofread"]
+    assert "改动明细" in get(f"/api/report/{jid2}").decode("utf-8")
+    bks = json.loads(get(f"/api/backups/{jid2}"))["backups"]
+    assert bks and bks[0]["tag"] == s3["latest_backup"], (bks, s3["latest_backup"])
+    print("✅ 单独校对完成:", s3["message"])
+    print(f"✅ 对照表/备份接口正常（备份 {len(bks)} 份，最新 {bks[0]['tag']}）")
+
+    try:
+        rb = post(f"/api/rollback/{jid2}", b"{}", {"Content-Type": "application/json"})
+    except urllib.error.HTTPError as _e:
+        raise SystemExit("❌ 回退失败: " + _e.read().decode())
+    assert rb["ok"] and rb["rollback"]["tag"], rb
+    assert not (bd / "book.proofread.md").exists()
+    assert not (bd / "proofread-report.html").exists()
+    assert (bd / "book.source.md").read_text(encoding="utf-8") == before_src, "正文应还原"
+    s4 = json.loads(get(f"/api/job/{jid2}"))
+    assert not s4.get("proofread") and Path(s4["epub_path"]).stat().st_size > 0
+    print("✅ 一键回退到校对前:", rb["rollback"]["tag"],
+          "恢复", len(rb["rollback"]["restored"]), "个文件，删除", rb["rollback"]["removed"])
+finally:
+    (server.ollama_chat_messages, server.ollama_loaded_models,
+     server.ollama_unload) = _keep
+    with server.JOBS_LOCK:
+        _j = server.JOBS.get(jid2)
+        if _j:
+            _j["action"] = "convert"
+            _j["proofread"] = None
+    server.save_jobs()
+    shutil.rmtree(tb, ignore_errors=True)
+    shutil.rmtree(sd, ignore_errors=True)
+
 # 断点续跑
 json.loads(get(f"/api/job/{jid2}"))
 r3 = post(f"/api/retry/{jid2}", b"{}", {"Content-Type": "application/json"})

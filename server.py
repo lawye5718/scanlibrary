@@ -53,6 +53,8 @@ urlopen = build_opener(ProxyHandler({})).open
 from urllib.error import URLError, HTTPError
 from concurrent.futures import ThreadPoolExecutor
 
+import proofread_report as pr      # 校对对照表 + 过程文件备份/回退
+
 APP_NAME = "ScanLibrary"
 VERSION = "0.1.0"
 
@@ -1587,7 +1589,7 @@ def proofread_chunk_guard(orig: str, fixed: str, low=None, high=None, sim_min=No
 
 
 def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
-                       job_id: str, log_fn, progress_cb=None) -> str:
+                       job_id: str, log_fn, progress_cb=None, records=None) -> str:
     """用本地千问逐块校对正文，任何异常/越界一律回退该块原文。
 
     工程约束（对应“防崩溃、防偷懒”）：
@@ -1596,6 +1598,9 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
       · num_predict 按块长设定，防跑飞；
       · 每块做长度比例 + 相似度兜底，不合格就原样保留；
       · 引注标记先转占位符，丢失即判该块失败，避免注释与章节脱钩。
+
+    records 传入 list 时，逐块记录 原文/校对后/是否回退/回退原因，
+    供生成人工确认用的「校对对照表」。
     """
     chunk_chars = int(cfg.get("proof_chunk_chars", PROOF_CHUNK_CHARS))
     low = float(cfg.get("proof_len_ratio_low", PROOF_MIN_RATIO))
@@ -1606,6 +1611,15 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
     log_fn(job_id, f"校对分块 {total} 块（约 {chunk_chars} 字/块，temperature=0.0、"
                    f"top_p=0.1，逐块做长度/相似度兜底）")
     out, n_ok, n_fallback, n_changed = [], 0, 0, 0
+
+    def _rec(status, reason, fixed):
+        """逐块记录结果，供「校对对照表」人工确认。"""
+        if records is None:
+            return
+        records.append({"i": i + 1, "total": total, "status": status,
+                        "reason": reason, "orig": c, "fixed": fixed,
+                        "changed": status == "ok" and _proof_norm(fixed) != _proof_norm(c)})
+
     for i, c in enumerate(chunks):
         if CANCEL_FLAGS.get(job_id):
             raise RuntimeError("已取消")
@@ -1627,6 +1641,7 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
             )
         except Exception as e:  # noqa
             log_fn(job_id, f"第 {i + 1}/{total} 块请求失败，保留原文：{e}")
+            _rec("fallback", f"请求失败：{e}", c)
             out.append(c)
             n_fallback += 1
             if progress_cb:
@@ -1636,6 +1651,7 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
         restored, expected, got = restore_note_refs(raw, saved)
         if expected and got < expected:
             log_fn(job_id, f"第 {i + 1}/{total} 块丢失引注标记（{got}/{expected}），保留原文")
+            _rec("fallback", f"丢失引注标记（{got}/{expected}）", c)
             out.append(c)
             n_fallback += 1
             if progress_cb:
@@ -1645,11 +1661,13 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
         ok, why = proofread_chunk_guard(c, restored, low, high, sim_min)
         if not ok:
             log_fn(job_id, f"第 {i + 1}/{total} 块判为不合格（{why}），保留原文")
+            _rec("fallback", why, c)
             out.append(c)
             n_fallback += 1
         else:
             if _proof_norm(restored) != _proof_norm(c):
                 n_changed += 1
+            _rec("ok", "", restored)
             out.append(restored)
             n_ok += 1
         if (i + 1) % 10 == 0:
@@ -1660,6 +1678,138 @@ def proofread_with_llm(text: str, base_url: str, model: str, cfg: dict,
     log_fn(job_id, f"校对完成：{n_ok} 块通过（其中 {n_changed} 块有改动），"
                    f"{n_fallback} 块回退原文")
     return "\n\n".join(out)
+
+
+def notes_block(notes):
+    """把注释列表渲染成附录 markdown 片段。"""
+    if not notes:
+        return ""
+    lines = ["# 注释"]
+    for note in notes:
+        lines.append(f"{note['label']} {note['text']}".strip())
+    return "\n\n".join(lines)
+
+
+def build_epub_from_source(full, notes, book_dir, slug, title, author, cfg,
+                           images_dir=None):
+    """把正文（可含 [[NOTE_REF]] 标记）切章并打包 EPUB。
+
+    转换流程与「单独校对」都走这里，保证两条路径产物结构完全一致。
+    返回 (epub_path, chapters)。
+    """
+    notes = notes or []
+    raw_chapters = split_chapters(full)
+    chapters = []
+    implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
+    if implicit_single:
+        title0 = raw_chapters[0][0] or "正文"
+        body0 = raw_chapters[0][1]
+        chapters = [{
+            "title": title0,
+            "body": body0,
+            "notes": collect_note_refs_for_epub(body0, notes),
+            "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
+        }]
+    else:
+        for title0, body0 in raw_chapters:
+            chapters.append({
+                "title": title0,
+                "body": body0,
+                "notes": collect_note_refs_for_epub(body0, notes),
+                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
+            })
+    if not chapters:
+        chapters = [{
+            "title": "正文",
+            "body": full,
+            "notes": collect_note_refs_for_epub(full, notes),
+            "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
+        }]
+    # 测试版单独命名，不覆盖全书版 EPUB
+    epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
+    epub = Path(book_dir) / epub_name
+    build_epub(epub, title, author, chapters, lang=cfg.get("lang", "zh-CN"),
+               assets_dir=Path(images_dir) if images_dir else (Path(book_dir) / "images"))
+    return epub, chapters
+
+
+def epub_to_markdown(epub_path):
+    """从 EPUB 抽取正文（仅当成书目录里既没有 book.source.md 也没有 book.md）。"""
+    parts = []
+    with zipfile.ZipFile(epub_path) as z:
+        names = sorted(n for n in z.namelist()
+                       if n.lower().endswith((".xhtml", ".html", ".htm")))
+        for n in names:
+            if Path(n).name.lower() in ("nav.xhtml", "toc.xhtml", "cover.xhtml", "titlepage.xhtml"):
+                continue
+            raw = z.read(n).decode("utf-8", "ignore")
+            raw = re.sub(r"<\?xml.*?\?>", "", raw, flags=re.S)
+            raw = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", raw, flags=re.S | re.I)
+            raw = re.sub(r"<h([1-6])[^>]*>(.*?)</h\1>",
+                         lambda m: "\n\n## " + re.sub(r"<[^>]+>", "", m.group(2)).strip() + "\n\n",
+                         raw, flags=re.S | re.I)
+            raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I)
+            raw = re.sub(r"</p>|</div>|</h[1-6]>", "\n\n", raw, flags=re.I)
+            txt = html.unescape(re.sub(r"<[^>]+>", "", raw))
+            txt = re.sub(r"[ \t]+\n", "\n", txt)
+            txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+            if txt:
+                parts.append(txt)
+    return "\n\n".join(parts)
+
+
+def load_proofread_source(book_dir):
+    """取「单独校对」的源文本。
+
+    优先 book.source.md（带引注标记，能保住注释与章节的绑定），
+    其次 book.md，最后才从 EPUB 反抽。返回 (正文, 注释列表, 来源说明)。
+    """
+    book_dir = Path(book_dir)
+    src = book_dir / "book.source.md"
+    if src.is_file() and src.read_text(encoding="utf-8").strip():
+        notes = None
+        nf = book_dir / "notes.json"
+        if nf.is_file():
+            try:
+                notes = json.loads(nf.read_text(encoding="utf-8"))
+            except Exception:  # noqa
+                notes = None
+        if not isinstance(notes, list):
+            notes = []
+        return src.read_text(encoding="utf-8"), notes, "book.source.md"
+    md = book_dir / "book.md"
+    if md.is_file() and md.read_text(encoding="utf-8").strip():
+        return md.read_text(encoding="utf-8"), [], "book.md（引注标记已扁平化）"
+    epubs = sorted(book_dir.glob("*.epub"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for e in epubs:
+        text = epub_to_markdown(e).strip()
+        if text:
+            return text, [], f"{e.name}（从 EPUB 反抽，注释只能在文末呈现）"
+    raise RuntimeError("找不到可校对的内容（缺少 book.source.md / book.md / EPUB）")
+
+
+def clear_proofread_products(book_dir):
+    """不启用校对时清掉上一轮校对产物，避免残留过期正文与对照表。"""
+    book_dir = Path(book_dir)
+    removed = [n for n in pr.PRODUCTS if (book_dir / n).exists()]
+    for name in removed:
+        (book_dir / name).unlink()
+    return removed
+
+
+def _proofread_summary(model, snap, records):
+    """汇总一次校对结果，挂到任务上供前端展示。"""
+    records = records or []
+    return {
+        "model": model,
+        "at": now_iso(),
+        "backup": Path(snap).name if snap else "",
+        "blocks": len(records),
+        "ok": sum(1 for r in records if r.get("status") == "ok"),
+        "fallback": sum(1 for r in records if r.get("status") != "ok"),
+        "changed": sum(1 for r in records if r.get("changed")),
+        "edits": len(pr.summarize_changes(records)),
+    }
 
 
 def run_job(job_id):
@@ -1821,18 +1971,19 @@ def run_job(job_id):
                 all_notes.extend(notes)
         full = "\n\n".join(item["text"] for item in processed if item["text"])
         full = collapse_repeated_paragraphs(full)
-        notes_md = ""
-        if all_notes:
-            note_lines = ["# 注释"]
-            for note in all_notes:
-                note_lines.append(f"{note['label']} {note['text']}".strip())
-            notes_md = "\n\n".join(note_lines)
+        notes_md = notes_block(all_notes)
         book_md = render_note_refs_as_text(full)
         if notes_md:
             book_md = book_md.rstrip() + "\n\n" + notes_md + "\n"
         (book_dir / "book.md").write_text(book_md, encoding="utf-8")
+        # 另存一份带引注标记的校对源：单独校对/重复校对都以它为起点，
+        # 保证可重复，且不会在上一轮校对结果上反复叠加。
+        (book_dir / "book.source.md").write_text(full, encoding="utf-8")
+        (book_dir / "notes.json").write_text(
+            json.dumps(all_notes, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # ---- 4. 可选：用已装的文本模型做校对 ----
+        # ---- 4. 可选：用已装的文本模型做校对（不勾选则整个跳过，最快出书）----
+        snap = None
         if cfg.get("proofread"):
             model = (cfg.get("proof_model") or "").strip() or "qwen14b-pro"
             cfg["proof_model"] = model
@@ -1840,6 +1991,9 @@ def run_job(job_id):
                 log(job_id, "未填写校对模型，跳过校对")
             else:
                 log(job_id, f"使用 {model} 逐段校对（较慢，可随时取消）")
+                # 校对前给过程文件打快照，结果不满意可一键回退
+                snap = pr.backup_artifacts(book_dir, note=f"转换流程内校对前（{model}）")
+                log(job_id, f"已备份校对前过程文件：{snap.relative_to(book_dir)}")
                 # ---- 关键阶段切换：先卸载 OCR 模型，再加载校对模型 ----
                 _url = cfg.get("ollama_url", "http://localhost:11434")
                 if cfg.get("free_memory_between_stages", True):
@@ -1857,54 +2011,38 @@ def run_job(job_id):
                     with JOBS_LOCK:
                         _job["progress"] = 80 + int(15 * done / max(1, total_chunks))
 
+                records = []
                 full = proofread_with_llm(full, _url, model, cfg, job_id, log,
-                                          progress_cb=_proof_progress)
+                                          progress_cb=_proof_progress, records=records)
                 full = collapse_repeated_paragraphs(full)
                 proofread_md = render_note_refs_as_text(full)
                 if notes_md:
                     proofread_md = proofread_md.rstrip() + "\n\n" + notes_md + "\n"
                 (book_dir / "book.proofread.md").write_text(proofread_md, encoding="utf-8")
                 book_md = proofread_md
+                report = pr.write_report(book_dir, job["title"], records, {
+                    "model": model,
+                    "chunk_chars": int(cfg.get("proof_chunk_chars", PROOF_CHUNK_CHARS)),
+                    "source": "book.source.md",
+                })
+                log(job_id, f"校对对照表已生成：{Path(report['html']).name}"
+                            f"（{len(records)} 块逐处列明改动，可人工确认）")
+                with JOBS_LOCK:
+                    job["proofread"] = _proofread_summary(model, snap, records)
+        else:
+            # 不勾选校对：清掉上一轮校对产物，直接打包 EPUB —— 最快路径
+            _stale = clear_proofread_products(book_dir)
+            log(job_id, "未启用千问校对，跳过校对直接生成 EPUB（更快）"
+                        + (f"，已清理上一轮校对产物：{'、'.join(_stale)}" if _stale else ""))
 
         # ---- 5. 切章 + 打包 EPUB ----
         log(job_id, "切分章节并生成 EPUB")
-        raw_chapters = split_chapters(full)
-        chapters = []
-        implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
-        if implicit_single:
-            title0 = raw_chapters[0][0] or "正文"
-            body0 = raw_chapters[0][1]
-            chapter_notes = collect_note_refs_for_epub(body0, all_notes)
-            chapters = [{
-                "title": title0,
-                "body": body0,
-                "notes": chapter_notes,
-                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
-            }]
-        else:
-            for title0, body0 in raw_chapters:
-                chapter_notes = collect_note_refs_for_epub(body0, all_notes)
-                chapters.append({
-                    "title": title0,
-                    "body": body0,
-                    "notes": chapter_notes,
-                    "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
-                })
-        if not chapters:
-            chapter_notes = collect_note_refs_for_epub(full, all_notes)
-            chapters = [{
-                "title": "正文",
-                "body": full,
-                "notes": chapter_notes,
-                "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
-            }]
-        # 测试版单独命名，不覆盖全书版 EPUB
-        epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
-        epub = book_dir / epub_name
-        build_epub(epub, job["title"], job.get("author", ""), chapters,
-                   lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir)
+        epub, chapters = build_epub_from_source(full, all_notes, book_dir, slug,
+                                                job["title"], job.get("author", ""),
+                                                cfg, images_dir=images_dir)
         md_out = book_dir / f"{slug}.md"
-        md_src = book_dir / ("book.proofread.md" if cfg.get("proofread") and (book_dir / "book.proofread.md").exists() else "book.md")
+        md_src = book_dir / ("book.proofread.md" if (book_dir / "book.proofread.md").exists()
+                             else "book.md")
         if md_src != md_out:
             shutil.copyfile(md_src, md_out)
 
@@ -1928,11 +2066,123 @@ def run_job(job_id):
         save_jobs()
 
 
+def run_proofread_job(job_id):
+    """单独校对任务：对已完成的成书重新做千问校对并重建 EPUB。
+
+    与转换流程共用同一套分块/兜底/引注保护逻辑；校对前先备份过程文件，
+    产出「校对对照表」供人工确认，不满意可一键回退。
+    """
+    with JOBS_LOCK:
+        job = JOBS[job_id]
+        job["status"] = "running"
+        job["started_at"] = time.time()
+        job["error"] = None
+        job["progress"] = 1
+        cfg = dict(job["config"])
+        title, author, slug = job["title"], job.get("author", ""), job["slug"]
+    try:
+        book_dir = ROOT / "books" / slug
+        if not book_dir.is_dir():
+            raise RuntimeError(f"找不到成书目录：{slug}")
+        model = (cfg.get("proof_model") or "").strip() or "qwen14b-pro"
+        cfg["proof_model"] = model
+        url = cfg.get("ollama_url", "http://localhost:11434")
+
+        source, notes, origin = load_proofread_source(book_dir)
+        log(job_id, f"校对源：{origin}，共 {len(source)} 字")
+        log(job_id, f"使用 {model} 逐块校对（较慢，可随时取消）")
+
+        snap = pr.backup_artifacts(book_dir, note=f"单独校对前（{model}）")
+        log(job_id, f"已备份校对前过程文件：{snap.relative_to(book_dir)}，不满意可一键回退")
+
+        # 阶段切换：先卸载 OCR 模型，再加载校对模型，避免挤爆 Metal 内存
+        if cfg.get("free_memory_between_stages", True):
+            _ocr_stem = (cfg.get("ocr_model") or "glm-ocr").split(":")[0]
+            for _m in ollama_loaded_models(url):
+                if _m.split(":")[0] == _ocr_stem:
+                    if ollama_unload(url, _m):
+                        log(job_id, f"已卸载 OCR 模型 {_m}，为校对模型腾出内存")
+                    time.sleep(3)
+                    break
+        _mem = available_memory_gb()
+        if _mem is not None:
+            log(job_id, f"校对前可用内存约 {_mem:.1f} GB")
+
+        def _progress(done, total_chunks, _job=job):
+            with JOBS_LOCK:
+                _job["progress"] = min(88, int(90 * done / max(1, total_chunks)))
+
+        records = []
+        fixed = proofread_with_llm(source, url, model, cfg, job_id, log,
+                                   progress_cb=_progress, records=records)
+        fixed = collapse_repeated_paragraphs(fixed)
+
+        notes_md = notes_block(notes)
+        fixed_md = render_note_refs_as_text(fixed)
+        if notes_md:
+            fixed_md = fixed_md.rstrip() + "\n\n" + notes_md + "\n"
+        (book_dir / "book.proofread.md").write_text(fixed_md, encoding="utf-8")
+
+        log(job_id, "用校对后正文重建 EPUB")
+        epub, chapters = build_epub_from_source(fixed, notes, book_dir, slug,
+                                                title, author, cfg)
+        md_src = book_dir / "book.proofread.md"
+        md_out = book_dir / f"{slug}.md"
+        if md_src.resolve() != md_out.resolve():
+            shutil.copyfile(md_src, md_out)
+        report = pr.write_report(book_dir, title, records, {
+            "model": model,
+            "chunk_chars": int(cfg.get("proof_chunk_chars", PROOF_CHUNK_CHARS)),
+            "source": origin,
+        })
+        summary = _proofread_summary(model, snap, records)
+        with JOBS_LOCK:
+            job["status"] = "done"
+            job["progress"] = 100
+            job["finished_at"] = time.time()
+            job["epub_path"] = str(epub)
+            job["epub_size"] = epub.stat().st_size
+            job["chapters"] = len(chapters)
+            job["proofread"] = summary
+            job["message"] = (f"校对完成：{summary['blocks']} 块 / 通过 {summary['ok']} / "
+                              f"回退 {summary['fallback']} / 改动 {summary['edits']} 处")
+        log(job_id, f"校对对照表：{Path(report['html']).name}"
+                    f"（{summary['edits']} 处改动已逐条列出，请人工确认）")
+        log(job_id, f"完成，EPUB 已按校对后正文重建：{epub}")
+    except Exception as e:  # noqa
+        with JOBS_LOCK:
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["message"] = f"校对失败：{e}"
+        log(job_id, f"校对失败：{e}")
+    finally:
+        CANCEL_FLAGS.pop(job_id, None)
+        save_jobs()
+
+
+def _load_notes(book_dir):
+    """读取成书目录里的注释列表（不存在或损坏时返回空列表）。"""
+    nf = Path(book_dir) / "notes.json"
+    if nf.is_file():
+        try:
+            data = json.loads(nf.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except Exception:  # noqa
+            pass
+    return []
+
+
 def worker_loop():
     while True:
         job_id = TASK_QUEUE.get()
         try:
-            run_job(job_id)
+            with JOBS_LOCK:
+                action = (JOBS.get(job_id) or {}).get("action", "convert")
+            if action == "proofread":
+                run_proofread_job(job_id)
+            else:
+                run_job(job_id)
         finally:
             TASK_QUEUE.task_done()
 
@@ -1951,7 +2201,25 @@ def job_public(jid):
         if d.get("epub_path") and Path(d["epub_path"]).exists():
             d["download_url"] = f"/api/download/{jid}"
             d["reveal_url"] = f"/api/reveal/{jid}"
-        return d
+    # ---- 校对相关状态：对照表 / 可回退备份 / 能否单独校对 ----
+    book_dir = ROOT / "books" / (d.get("slug") or "")
+    d["has_report"] = (book_dir / "proofread-report.html").is_file()
+    if d["has_report"]:
+        d["report_url"] = f"/api/report/{jid}"
+        d["report_md_url"] = f"/api/report-md/{jid}"
+    d["proofread_done"] = (book_dir / "book.proofread.md").is_file()
+    backups = pr.list_backups(book_dir) if book_dir.is_dir() else []
+    d["backup_count"] = len(backups)
+    if backups:
+        d["latest_backup"] = backups[0].get("tag", "")
+        d["backup_note"] = backups[0].get("note", "")
+        d["backup_at"] = backups[0].get("created_at", "")
+    can = False
+    if book_dir.is_dir():
+        can = (any((book_dir / n).is_file() for n in ("book.source.md", "book.md"))
+               or bool(list(book_dir.glob("*.epub"))))
+    d["can_proofread"] = can
+    return d
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2048,6 +2316,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             md = Path(ROOT) / "books" / j["slug"] / "book.md"
             self.send_file(md, download_name=f"{j.get('title', 'book')}.md", mime="text/markdown; charset=utf-8")
+            return
+
+        m = re.match(r"^/api/report/([a-f0-9\-]+)$", p)
+        if m:
+            j = JOBS.get(m.group(1)) or {}
+            rep = ROOT / "books" / (j.get("slug") or "") / "proofread-report.html"
+            if not rep.is_file():
+                self.send_error(404)
+                return
+            self.send_file(rep, None, "text/html; charset=utf-8")
+            return
+
+        m = re.match(r"^/api/report-md/([a-f0-9\-]+)$", p)
+        if m:
+            j = JOBS.get(m.group(1)) or {}
+            rep = ROOT / "books" / (j.get("slug") or "") / "proofread-report.md"
+            name = f"{j.get('title') or 'book'}-校对对照表.md"
+            self.send_file(rep, name, "text/markdown; charset=utf-8")
+            return
+
+        m = re.match(r"^/api/backups/([a-f0-9\-]+)$", p)
+        if m:
+            j = JOBS.get(m.group(1)) or {}
+            bd = ROOT / "books" / (j.get("slug") or "")
+            self.send_json({"ok": True, "backups": pr.list_backups(bd)})
             return
 
         m = re.match(r"^/api/reveal/([a-f0-9\-]+)$", p)
@@ -2243,7 +2536,7 @@ class Handler(BaseHTTPRequestHandler):
                     "filename": fname, "config": cfg,
                     "created_at": time.time(), "message": "排队中",
                     "total_pages": total_pages, "mode": mode,
-                    "estimate": estimate_str,
+                    "estimate": estimate_str, "action": "convert",
                 }
             TASK_QUEUE.put(job_id)
             save_jobs()
@@ -2277,6 +2570,105 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             save_jobs()
             self.send_json({"ok": True})
+            return
+
+        m = re.match(r"^/api/proofread/([a-f0-9\-]+)$", p)
+        if m:
+            jid = m.group(1)
+            try:
+                raw = self.read_body()
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                body = {}
+            with JOBS_LOCK:
+                j = JOBS.get(jid)
+                if not j:
+                    self.send_json({"error": "未找到任务"}, 404)
+                    return
+                if j["status"] == "running":
+                    self.send_json({"error": "任务正在运行"}, 400)
+                    return
+                cfg = dict(j.get("config", {}))
+                if str(body.get("model") or "").strip():
+                    cfg["proof_model"] = str(body["model"]).strip()
+                if not str(cfg.get("proof_model") or "").strip():
+                    cfg["proof_model"] = "qwen14b-pro"
+                for k in ("proof_chunk_chars", "proof_len_ratio_low",
+                          "proof_len_ratio_high", "proof_similarity_min",
+                          "proof_num_ctx", "proof_timeout"):
+                    if body.get(k) not in (None, ""):
+                        cfg[k] = body[k]
+                j["config"] = cfg
+                j["action"] = "proofread"
+                j.update({"status": "queued", "progress": 0, "error": None,
+                          "message": "排队等待校对", "proofread": None})
+            TASK_QUEUE.put(jid)
+            save_jobs()
+            self.send_json({"ok": True, "job": job_public(jid)})
+            return
+
+        m = re.match(r"^/api/rollback/([a-f0-9\-]+)$", p)
+        if m:
+            jid = m.group(1)
+            try:
+                raw = self.read_body()
+                body = json.loads(raw.decode("utf-8")) if raw else {}
+            except Exception:
+                body = {}
+            j = JOBS.get(jid)
+            if not j:
+                self.send_json({"error": "未找到任务"}, 404)
+                return
+            if j["status"] == "running":
+                self.send_json({"error": "任务正在运行，请先取消再回退"}, 400)
+                return
+            try:
+                book_dir = ROOT / "books" / j["slug"]
+                # 先暂存现有 EPUB：回退会删除快照里没有的 epub，
+                # 万一随后重建失败，还能把文件原样放回去
+                _epub_keep = {p: p.read_bytes() for p in book_dir.glob("*.epub")}
+                info = pr.restore_backup(book_dir, body.get("backup") or "latest")
+                src = book_dir / "book.source.md"
+                if not src.is_file():
+                    src = book_dir / "book.md"
+                if src.is_file():
+                    try:
+                        cfg = dict(j.get("config", {}))
+                        epub, chapters = build_epub_from_source(
+                            src.read_text(encoding="utf-8"), _load_notes(book_dir),
+                            book_dir, j["slug"], j["title"], j.get("author", ""), cfg)
+                        flat = book_dir / "book.md"
+                        md_out = book_dir / f"{j['slug']}.md"
+                        if flat.is_file():
+                            # slug 恰好等于 "book" 时两者同路径，跳过即可
+                            if flat.resolve() != md_out.resolve():
+                                shutil.copyfile(flat, md_out)
+                        else:
+                            md_out.write_text(
+                                render_note_refs_as_text(src.read_text(encoding="utf-8")),
+                                encoding="utf-8")
+                        with JOBS_LOCK:
+                            j["epub_path"] = str(epub)
+                            j["epub_size"] = epub.stat().st_size
+                            j["chapters"] = len(chapters)
+                        info["epub"] = epub.name
+                    except Exception as _e:
+                        # 重建失败：把暂存的 EPUB 原样放回，绝不丢成品
+                        for _p, _data in _epub_keep.items():
+                            _p.write_bytes(_data)
+                        info["epub_rebuild_failed"] = str(_e)
+                with JOBS_LOCK:
+                    j["proofread"] = None
+                    j["error"] = None
+                    j["message"] = f"已回退到校对前备份 {info['tag']}"
+                save_jobs()
+                LOG_BUFFERS.setdefault(jid, []).append(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] 一键回退：恢复 "
+                    f"{'、'.join(info['restored']) or '（无）'}；删除 "
+                    f"{'、'.join(info['removed']) or '（无）'}")
+                self.send_json({"ok": True, "rollback": info, "job": job_public(jid)})
+            except Exception as e:
+                self.send_json({"error": str(e)}, 400)
             return
 
         m = re.match(r"^/api/retry/([a-f0-9\-]+)$", p)
