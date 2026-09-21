@@ -127,11 +127,14 @@ with zipfile.ZipFile(epub_path) as z:
 print("✅ EPUB 结构校验通过（mimetype未压缩/置首，container/opf/ncx/5页xhtml齐全）")
 
 # pandoc 读回验证（可选，缺 pandoc 不算失败）
-p = subprocess.run(["pandoc", str(epub_path), "-t", "plain"], capture_output=True, text=True)
-if p.returncode == 0:
-    assert "第 page_0001" in p.stdout
-    print("✅ pandoc 读回校验通过")
-else:
+try:
+    p = subprocess.run(["pandoc", str(epub_path), "-t", "plain"], capture_output=True, text=True)
+    if p.returncode == 0:
+        assert "第 page_0001" in p.stdout
+        print("✅ pandoc 读回校验通过")
+    else:
+        print("ℹ️ 未安装 pandoc，跳过读回校验")
+except FileNotFoundError:
     print("ℹ️ 未安装 pandoc，跳过读回校验")
 
 # 下载

@@ -1257,10 +1257,9 @@ def run_job(job_id):
         build_epub(epub, job["title"], job.get("author", ""), chapters,
                    lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir, notes=all_notes)
         md_out = book_dir / f"{slug}.md"
-        shutil.copyfile(
-            book_dir / ("book.proofread.md" if cfg.get("proofread") and (book_dir / "book.proofread.md").exists() else "book.md"),
-            md_out,
-        )
+        md_src = book_dir / ("book.proofread.md" if cfg.get("proofread") and (book_dir / "book.proofread.md").exists() else "book.md")
+        if md_src != md_out:
+            shutil.copyfile(md_src, md_out)
 
         with JOBS_LOCK:
             job["status"] = "done"
