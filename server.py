@@ -1000,7 +1000,7 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
 
     ordered = sorted(
         normalize_layout_boxes(boxes),
-        key=lambda b: (_layout_label_priority(b.get("label", "")), _area(b)),
+        key=lambda b: (_area(b), _layout_label_priority(b.get("label", ""))),
         reverse=True,
     )
     kept = []
@@ -1018,6 +1018,8 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
             kept_label = k.get("label", "")
             kept_kind = _layout_label_kind(kept_label)
             if kind == "visual" and kept_kind != "visual":
+                if _bbox_cover(bb, k["bbox"]) < cover_thr:
+                    retained.append(k)
                 continue
             if kept_kind == "visual" and kind != "visual":
                 retained.append(k)
