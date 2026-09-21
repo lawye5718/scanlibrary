@@ -210,6 +210,8 @@ body_text2, notes2, _ = server.extract_footnotes_from_page(
     "第一章 起始\n\n1. 研究背景\n\n这里继续正文。", 2, 10
 )
 assert "1. 研究背景" in body_text2 and not notes2, "正文编号段落不应被误抽成注释"
+assert not server.is_chapter_line("1. 研究背景")
+assert server.is_chapter_line("1. Chapter One")
 stitched = server.merge_wrapped_lines(server.join_processed_pages([
     {"page": 1, "text": "这一段跨页未完", "illustration": False},
     {"page": 2, "text": "下一页接着写完。\n\n新一段。", "illustration": False},
@@ -247,7 +249,10 @@ manual_cfg = {
     "chapter_method": "toc",
     "chapter_target_pages": 2,
 }
-toc_chapters = server.build_manual_chapters(manual_processed, manual_cfg, [])
+assert not server.has_manual_chapter_config(manual_cfg)
+manual_cfg_enabled = dict(manual_cfg, chapter_config_enabled=True)
+assert server.has_manual_chapter_config(manual_cfg_enabled)
+toc_chapters = server.build_manual_chapters(manual_processed, manual_cfg_enabled, [])
 assert [t for t, _ in toc_chapters[:6]] == ["封面", "封底", "扉页", "版权页", "目录", "序言"], toc_chapters
 assert [t for t, _ in toc_chapters[6:]] == ["第一章 起始", "第二章 收束"], toc_chapters
 fixed_chapters = server.build_manual_chapters(
@@ -256,6 +261,11 @@ fixed_chapters = server.build_manual_chapters(
     [],
 )
 assert len(fixed_chapters) == 2 and "续页收束。" in fixed_chapters[0][1], fixed_chapters
+mixed_page_chapters = server.build_manual_chapters([
+    {"page": 9, "text": "正文页。", "illustration": False},
+    {"page": 9, "text": server.image_marker_md(Path("plate.jpg"), "插图"), "illustration": True},
+], {"chapter_method": "fixed", "chapter_target_pages": 1}, [])
+assert "正文页。" in mixed_page_chapters[0][1] and "![插图](images/plate.jpg)" in mixed_page_chapters[0][1], mixed_page_chapters
 print("✅ 人工分页分章（目录页/固定页数）可用")
 
 # EPUB 图片路径：正文中的插图必须指向 OEBPS/images/ 下的资源

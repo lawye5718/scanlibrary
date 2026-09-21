@@ -950,11 +950,11 @@ def map_toc_page_to_actual(page_no: int, body_pages: list[int]) -> int | None:
     return body_pages[idx] if idx < len(body_pages) else None
 
 
-def build_toc_chapters_from_pages(processed: list[dict], toc_span, body_pages: list[int]) -> list[dict]:
-    if not toc_span or not body_pages:
+def build_toc_chapters_from_pages(processed: list[dict], toc_pages: list[int], body_pages: list[int]) -> list[dict]:
+    if not toc_pages or not body_pages:
         return []
-    left, right = toc_span
-    toc_items = [p for p in processed if left <= int(p.get("page", 0)) <= right]
+    toc_page_set = set(toc_pages)
+    toc_items = [p for p in processed if int(p.get("page", 0)) in toc_page_set]
     toc_text = "\n".join((item.get("text") or "") for item in toc_items)
     entries = extract_toc_entries_from_text(toc_text)
     if not entries:
@@ -974,22 +974,59 @@ def build_toc_chapters_from_pages(processed: list[dict], toc_span, body_pages: l
     return mapped
 
 
+def trim_toc_chapters_to_body(toc_chapters: list[dict], body_pages: list[int]) -> list[dict]:
+    if not toc_chapters or not body_pages:
+        return []
+    body_first, body_last = body_pages[0], body_pages[-1]
+    out = []
+    for item in sorted(toc_chapters, key=lambda x: x.get("start_page", 0)):
+        start = max(body_first, int(item.get("start_page", body_first)))
+        end = min(body_last, int(item.get("end_page", body_last)))
+        if end < start:
+            continue
+        out.append({
+            "title": item.get("title") or "正文",
+            "start_page": start,
+            "end_page": end,
+        })
+    return out
+
+
 def split_body_by_fixed_page_chunks(processed: list[dict], pages_per_chapter=20, max_extra_pages=6) -> list[tuple[str, str]]:
-    pages = [p for p in sorted(processed, key=lambda x: int(x.get("page", 0))) if (p.get("text") or "").strip()]
-    if not pages:
+    page_groups = []
+    current_page = None
+    current_items = []
+    for item in sorted(processed, key=lambda x: (int(x.get("page", 0)), bool(x.get("illustration")))):
+        if not (item.get("text") or "").strip():
+            continue
+        page = int(item.get("page", 0))
+        if page != current_page:
+            if current_items:
+                page_groups.append((current_page, current_items))
+            current_page = page
+            current_items = [item]
+        else:
+            current_items.append(item)
+    if current_items:
+        page_groups.append((current_page, current_items))
+    if not page_groups:
         return []
     pages_per_chapter = max(1, int(pages_per_chapter or 20))
     out = []
     cursor = 0
     chapter_no = 1
-    while cursor < len(pages):
-        end = min(len(pages) - 1, cursor + pages_per_chapter - 1)
-        while end + 1 < len(pages) and (end - cursor + 1) < pages_per_chapter + max_extra_pages:
-            next_first = ((pages[end + 1].get("text") or "").strip().split("\n", 1)[0].strip())
-            if is_chapter_line(next_first) or page_text_ends_cleanly(pages[end].get("text") or ""):
+    while cursor < len(page_groups):
+        end = min(len(page_groups) - 1, cursor + pages_per_chapter - 1)
+        while end + 1 < len(page_groups) and (end - cursor + 1) < pages_per_chapter + max_extra_pages:
+            next_first = ((_page_text_for_chapter(page_groups[end + 1][1]) or "").split("\n", 1)[0].strip())
+            if is_chapter_line(next_first) or page_text_ends_cleanly(_page_text_for_chapter(page_groups[end][1])):
                 break
             end += 1
-        body = _page_text_for_chapter(pages[cursor:end + 1])
+        body = _page_text_for_chapter([
+            entry
+            for _, items in page_groups[cursor:end + 1]
+            for entry in items
+        ])
         if body:
             out.append((f"第{chapter_no}章", body))
             chapter_no += 1
@@ -998,20 +1035,22 @@ def split_body_by_fixed_page_chunks(processed: list[dict], pages_per_chapter=20,
 
 
 def has_manual_chapter_config(cfg: dict) -> bool:
-    keys = {
-        "cover_page", "back_cover_page", "title_page", "copyright_page",
-        "toc_page_range", "preface_page_range", "chapter_method", "chapter_target_pages",
-    }
-    return any(k in (cfg or {}) for k in keys)
+    return bool((cfg or {}).get("chapter_config_enabled"))
 
 
 def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: list[dict]) -> list[tuple[str, str]]:
-    pages_by_no = {int(item.get("page", 0)): item for item in processed if int(item.get("page", 0)) > 0}
+    pages_by_no = {}
+    for item in sorted(processed, key=lambda x: int(x.get("page", 0))):
+        page = int(item.get("page", 0))
+        if page <= 0:
+            continue
+        pages_by_no.setdefault(page, []).append(item)
     if not pages_by_no:
         return []
     ordered_pages = sorted(pages_by_no)
     assigned = set()
     front_sections = []
+    toc_selected = []
 
     def add_single(key, title):
         page = _cfg_page_value((cfg or {}).get(key))
@@ -1020,6 +1059,7 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
             front_sections.append((title, [page]))
 
     def add_span(key, title):
+        nonlocal toc_selected
         span = _cfg_page_span((cfg or {}).get(key))
         if not span:
             return
@@ -1028,6 +1068,8 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
         if selected:
             assigned.update(selected)
             front_sections.append((title, selected))
+            if title == "目录":
+                toc_selected = list(selected)
 
     add_single("cover_page", "封面")
     add_single("back_cover_page", "封底")
@@ -1038,21 +1080,26 @@ def build_manual_chapters(processed: list[dict], cfg: dict, pdf_toc_chapters: li
 
     out = []
     for title, page_nums in front_sections:
-        body = _page_text_for_chapter([pages_by_no[p] for p in page_nums])
+        body = _page_text_for_chapter([entry for p in page_nums for entry in pages_by_no[p]])
         if body:
             out.append((title, body))
 
-    body_processed = [pages_by_no[p] for p in ordered_pages if p not in assigned]
-    body_page_nums = [int(item.get("page", 0)) for item in body_processed]
+    body_page_nums = [p for p in ordered_pages if p not in assigned]
+    body_processed = [entry for p in body_page_nums for entry in pages_by_no[p]]
     if not body_processed:
         return out
 
     method = str((cfg or {}).get("chapter_method") or "toc").strip().lower()
-    toc_chapters = build_toc_chapters_from_pages(processed, _cfg_page_span((cfg or {}).get("toc_page_range")), body_page_nums)
+    toc_chapters = build_toc_chapters_from_pages(processed, toc_selected, body_page_nums)
     if not toc_chapters and pdf_toc_chapters:
-        toc_chapters = pdf_toc_chapters
+        toc_chapters = trim_toc_chapters_to_body(pdf_toc_chapters, body_page_nums)
     if method == "toc" and toc_chapters:
         out.extend(split_chapters_by_pdf_toc(body_processed, toc_chapters))
+        return out
+    if method == "toc":
+        body = _page_text_for_chapter(body_processed)
+        if body:
+            out.append(("正文", body))
         return out
     pages_per_chapter = int((cfg or {}).get("chapter_target_pages") or 20)
     out.extend(split_body_by_fixed_page_chunks(body_processed, pages_per_chapter=pages_per_chapter))
@@ -1698,11 +1745,29 @@ CHAPTER_PATTERNS = [
 ]
 
 
+def looks_like_numeric_chapter_line(line: str) -> bool:
+    m = re.match(r"^([0-9]{1,3})\s*[、.．]\s*(\S.*)$", line or "")
+    if not m:
+        return False
+    tail = m.group(2).strip()
+    if len(tail) < 2 or len(tail) > 24:
+        return False
+    if re.search(r"[，。！？；：,:;!?]", tail):
+        return False
+    if len(re.findall(r"\s", tail)) > 2:
+        return False
+    if re.search(r"[A-Za-z]", tail):
+        return True
+    return bool(re.search(r"(章|回|篇|卷|部|集|讲|幕|序|引子|楔子|尾声|附录)", tail))
+
+
 def is_chapter_line(line):
     s = line.strip()
     if not s:
         return False
     if re.match(r"^#+\s+\S", s):
+        return True
+    if looks_like_numeric_chapter_line(s):
         return True
     if len(s) > 60:
         return False
