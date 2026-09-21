@@ -1017,6 +1017,8 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
             kept_kind = _layout_label_kind(kept_label)
             if kind == "visual" and kept_kind != "visual":
                 continue
+            if kept_kind == "visual" and kind != "visual":
+                continue
             if _layout_label_priority(kept_label) >= _layout_label_priority(label):
                 drop = True
                 break
@@ -1346,11 +1348,12 @@ def inline_md(s, note_href_builder=None, note_ref_id_builder=None):
     def repl_note_ref(m):
         nid = m.group(1)
         label = m.group(2)
+        display_label = f"[{label}]" if re.fullmatch(r"\d{1,3}", label.strip()) else label
         href = note_href_builder(nid) if note_href_builder else f"notes.xhtml#note-{nid}"
         ref_id = note_ref_id_builder(nid) if note_ref_id_builder else f"note-ref-{nid}"
         return (
             f'<a id="{html.escape(ref_id, quote=True)}" epub:type="noteref" class="noteref" '
-            f'href="{html.escape(href, quote=True)}">{label}</a>'
+            f'href="{html.escape(href, quote=True)}">{display_label}</a>'
         )
 
     s = re.sub(r"\[\[NOTE_REF:(\d+)\|(.+?)\]\]", repl_note_ref, s)
@@ -1492,7 +1495,7 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             chapter_notes = chapter.get("notes") or []
             fname = f"chap_{i + 1:04d}.xhtml"
             chapter_note_labels = {
-                note["id"]: f"[{idx}]"
+                note["id"]: str(idx)
                 for idx, note in enumerate(chapter_notes, 1)
             }
             body_for_render = (
@@ -1518,7 +1521,8 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             if chapter_notes:
                 note_lines = ['<section class="chapter-notes" epub:type="endnotes">', '<h3>注释</h3>']
                 for note in chapter_notes:
-                    label = html.escape(chapter_note_labels.get(note["id"], note.get("label") or f"[{note['id']}]"))
+                    note_label = chapter_note_labels.get(note["id"])
+                    label = html.escape(f"[{note_label}]" if note_label else (note.get("label") or f"[{note['id']}]"))
                     text = inline_md(note.get("text", ""))
                     backrefs = note_backrefs.get(note["id"], [])
                     if backrefs:
