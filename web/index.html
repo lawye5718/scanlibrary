@@ -143,6 +143,44 @@
         <label>页面范围（仅全书模式下可自定义，留空=全部）</label>
         <input id="fRange" placeholder="留空处理全书" disabled/>
       </div>
+      <div style="grid-column:1/-1">
+        <label class="chk"><input type="checkbox" id="fChapterAssist" checked/> 启用人工辅助分页/分章（可指定封面、目录、序言与正文切章规则）</label>
+      </div>
+      <div>
+        <label>封面页（单页）</label>
+        <input id="fCoverPage" type="number" value="1" min="1"/>
+      </div>
+      <div>
+        <label>封底页（单页）</label>
+        <input id="fBackCoverPage" type="number" value="2" min="1"/>
+      </div>
+      <div>
+        <label>扉页（单页）</label>
+        <input id="fTitlePage" type="number" value="3" min="1"/>
+      </div>
+      <div>
+        <label>版权页（单页）</label>
+        <input id="fCopyrightPage" type="number" value="4" min="1"/>
+      </div>
+      <div>
+        <label>目录页范围</label>
+        <input id="fTocRange" value="5-6" placeholder="例如 5-6"/>
+      </div>
+      <div>
+        <label>序言页范围</label>
+        <input id="fPrefaceRange" value="7-8" placeholder="例如 7-8"/>
+      </div>
+      <div>
+        <label>正文分章方式</label>
+        <select id="fChapterMethod">
+          <option value="toc">优先按目录页自动分章</option>
+          <option value="fixed">按人工指定页数批量截取</option>
+        </select>
+      </div>
+      <div>
+        <label>每章目标页数（批量截取时使用）</label>
+        <input id="fChapterPages" type="number" value="20" min="1"/>
+      </div>
     </div>
 
     <div class="row">
@@ -156,6 +194,9 @@
     <div class="hint" id="modeHint">
       当前为测试版模式：只转换前 10 页生成「试读版 EPUB」，验证 OCR 效果后再切换全书模式。
       分页结果会缓存 —— 测试满意后跑全书时，前 10 页不会重复转换。
+    </div>
+    <div class="hint" id="chapterHint">
+      当前按目录页自动分章；若目录识别不稳，可切换为“按人工指定页数批量截取”，系统会在目标页后顺延到明显段落结束处再收章。
     </div>
   </div>
 
@@ -252,11 +293,35 @@ $("#fMode").onchange = () => {
     $("#modeHint").textContent = "当前为全书模式：完整转换整本书。上传后任务卡片会显示基于历史速度的预计耗时；无历史数据时给出参考区间。";
   }
 };
+$("#fChapterMethod").onchange = updateChapterHint;
+$("#fChapterAssist").onchange = updateChapterHint;
+updateChapterHint();
 
 function parseRange(){
   const v = $("#fRange").value.trim();
   const m = v.match(/^(\d+)\s*-\s*(\d+)$/);
   return m ? [parseInt(m[1]), parseInt(m[2])] : v.match(/^\d+$/) ? [parseInt(v), parseInt(v)] : null;
+}
+
+function parseLooseRange(id){
+  const v = $(id).value.trim();
+  if(!v) return null;
+  const m = v.match(/^(\d+)\s*-\s*(\d+)$/);
+  return m ? [parseInt(m[1]), parseInt(m[2])] : v.match(/^\d+$/) ? [parseInt(v), parseInt(v)] : null;
+}
+
+function updateChapterHint(){
+  const enabled = $("#fChapterAssist").checked;
+  const fixed = $("#fChapterMethod").value === "fixed";
+  ["#fCoverPage","#fBackCoverPage","#fTitlePage","#fCopyrightPage","#fTocRange","#fPrefaceRange","#fChapterMethod"].forEach(id => {
+    $(id).disabled = !enabled;
+  });
+  $("#fChapterPages").disabled = !enabled || !fixed;
+  $("#chapterHint").textContent = !enabled
+    ? "当前沿用系统自动切章；需要人工辅助时再勾选上面的分页/分章选项。"
+    : fixed
+    ? "当前按人工指定页数批量截取；系统会以目标页数为基准，若该页段落未完则自动顺延到明显分段结束处再收章。"
+    : "当前按目录页自动分章；若目录识别不稳，可切换为“按人工指定页数批量截取”，系统会在目标页后顺延到明显段落结束处再收章。";
 }
 
 function config(){
@@ -272,6 +337,15 @@ function config(){
     proof_model: $("#fProofModel").value.trim() || "qwen14b-pro",
     proof_chunk_chars: parseInt($("#fProofChunk").value) || 700,
     force_reocr: $("#fForce").checked,
+    chapter_config_enabled: $("#fChapterAssist").checked,
+    cover_page: parseInt($("#fCoverPage").value) || 1,
+    back_cover_page: parseInt($("#fBackCoverPage").value) || 2,
+    title_page: parseInt($("#fTitlePage").value) || 3,
+    copyright_page: parseInt($("#fCopyrightPage").value) || 4,
+    toc_page_range: parseLooseRange("#fTocRange") || [5, 6],
+    preface_page_range: parseLooseRange("#fPrefaceRange") || [7, 8],
+    chapter_method: $("#fChapterMethod").value,
+    chapter_target_pages: parseInt($("#fChapterPages").value) || 20,
     lang: "zh-CN",
     num_ctx: 16384,
   };
