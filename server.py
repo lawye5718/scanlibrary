@@ -755,11 +755,13 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
     """PP-Structure 版面分析 + glm-ocr 文本识别。
     流程：
       1) PaddleOCR 检测版面区域
-      2) 丢弃 header/footer/page_number/footnote/seal（规则化）
+      2) 丢弃 header/footer/page_number/seal（规则化）；
+         footnote 不丢，随正文 OCR 后由 extract_footnotes_from_page 提取为 EPUB 注释
       3) text/title 类: 裁剪后调 glm-ocr
-      4) figure 类: 保留为 jpg，markdown 引用（图区不 OCR）
+      4) figure 类: 保留为 jpg（image_marker_md，统一资产管线）
       5) table/formula: 保留为 jpg（不强求 OCR 还原复杂排版）
       6) 按阅读顺序拼接（自上而下，自左而右）
+      版面分析失败会 raise，由 run_job 兜底标记 OCR-FAILED 供重跑
     """
     if Image is None:
         return NO_TEXT_TOKEN
