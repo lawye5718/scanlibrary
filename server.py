@@ -998,11 +998,18 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
         x1, y1, x2, y2 = b["bbox"]
         return max(0, x2 - x1) * max(0, y2 - y1)
 
-    ordered = sorted(
-        normalize_layout_boxes(boxes),
-        key=lambda b: (_area(b), _layout_label_priority(b.get("label", ""))),
+    normalized = normalize_layout_boxes(boxes)
+    visual_boxes = sorted(
+        [b for b in normalized if _layout_label_kind(b.get("label", "")) == "visual"],
+        key=_area,
         reverse=True,
     )
+    other_boxes = sorted(
+        [b for b in normalized if _layout_label_kind(b.get("label", "")) != "visual"],
+        key=_area,
+        reverse=True,
+    )
+    ordered = visual_boxes + other_boxes
     kept = []
     for b in ordered:
         bb = b.get("bbox")
