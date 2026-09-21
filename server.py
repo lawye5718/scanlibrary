@@ -550,6 +550,9 @@ def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
         if len(norm) >= 80:
             dup_recent = False
             for prev_norm in recent_norms[-8:]:
+                if prev_norm == norm:
+                    dup_recent = True
+                    break
                 if prev_norm and difflib.SequenceMatcher(None, prev_norm, norm).ratio() >= 0.985:
                     dup_recent = True
                     break
@@ -1194,11 +1197,14 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                     label = html.escape(note.get("label") or f"[{note['id']}]")
                     text = inline_md(note.get("text", ""))
                     backrefs = note_backrefs.get(note["id"], [])
-                    backref_html = " ".join(
-                        f'<a class="backref" aria-label="返回正文中的注释引用" href="#{html.escape(ref_id, quote=True)}">'
-                        f'返回正文{"" if idx == 1 else idx}</a>'
-                        for idx, ref_id in enumerate(backrefs, 1)
-                    )
+                    if backrefs:
+                        backref_html = " ".join(
+                            f'<a class="backref" aria-label="返回正文中的注释引用" href="#{html.escape(ref_id, quote=True)}">'
+                            f'返回正文{"" if idx == 1 else idx}</a>'
+                            for idx, ref_id in enumerate(backrefs, 1)
+                        )
+                    else:
+                        backref_html = f'<a class="backref" aria-label="返回本章开头" href="#chapter-{i + 1}">返回本章</a>'
                     note_lines.append(
                         f'<p id="note-{note["id"]}" epub:type="endnote"><strong>{label}</strong> {text}'
                         f'{backref_html}</p>'
