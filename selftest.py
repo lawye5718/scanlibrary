@@ -126,6 +126,48 @@ with zipfile.ZipFile(epub_path) as z:
     assert "第 page_0001" in all_body, "stub 后端未生成占位正文"
 print("✅ EPUB 结构校验通过（mimetype未压缩/置首，container/opf/ncx/5页xhtml齐全）")
 
+# 注释抽取：只有能在正文里回链的候选注释才应移出正文，避免打乱正文结构
+body_text, notes, next_note_id = server.extract_footnotes_from_page(
+    "第一章 起始[1]\n\n正文段落。\n\n[1] 这是注释内容。", 1, 1
+)
+assert "[[NOTE_REF:1|[1]]]" in body_text and len(notes) == 1 and next_note_id == 2
+body_text2, notes2, _ = server.extract_footnotes_from_page(
+    "第一章 起始\n\n1. 研究背景\n\n这里继续正文。", 2, 10
+)
+assert "1. 研究背景" in body_text2 and not notes2, "正文编号段落不应被误抽成注释"
+print("✅ 注释抽取不会打乱正文")
+
+# EPUB 图片路径：正文中的插图必须指向 OEBPS/images/ 下的资源
+tmp_epub = ROOT / "books" / "图片测试.epub"
+server.build_epub(
+    tmp_epub,
+    "图片测试",
+    "测试作者",
+    [{"title": "正文", "body": server.image_marker_md(Path("plate.jpg"), "插图"), "illustration_only": True}],
+)
+with zipfile.ZipFile(tmp_epub) as z:
+    chap = z.read("OEBPS/chap_0001.xhtml").decode("utf-8")
+    assert 'src="images/plate.jpg"' in chap, chap
+print("✅ EPUB 插图路径正确")
+
+if server.Image is not None:
+    probe = ROOT / "paddle-probe.jpg"
+    server.Image.new("RGB", (240, 240), "white").save(probe, "JPEG")
+    old_detect = server.paddle_layout_detect
+    old_ocr = server.ocr_page_glmocr
+    try:
+        server.paddle_layout_detect = lambda _p: [
+            {"label": "text", "bbox": [0, 0, 220, 100]},
+            {"label": "footnote_content", "bbox": [0, 120, 220, 220]},
+        ]
+        server.ocr_page_glmocr = lambda _cfg, p, attempt=1: "正文[1]" if "_p0_" in p.stem else "[1] 这是脚注"
+        mixed = server.ocr_page_paddle_glm({}, probe)
+        assert mixed.split("\n\n") == ["正文[1]", "[1] 这是脚注"], mixed
+        print("✅ paddle-layout 保留脚注文本顺序")
+    finally:
+        server.paddle_layout_detect = old_detect
+        server.ocr_page_glmocr = old_ocr
+
 # pandoc 读回验证（可选，缺 pandoc 不算失败）
 try:
     p = subprocess.run(["pandoc", str(epub_path), "-t", "plain"], capture_output=True, text=True)
