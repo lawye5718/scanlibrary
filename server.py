@@ -1039,7 +1039,7 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
             continue
         kept = retained
         kept.append(b)
-    return kept
+    return sorted(kept, key=lambda b: (b["bbox"][1], b["bbox"][0]))
 
 
 def should_keep_visual_box(label: str, score: float, x1: int, y1: int, x2: int, y2: int, page_w: int, page_h: int) -> bool:
