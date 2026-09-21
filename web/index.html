@@ -116,7 +116,8 @@
       <div>
         <label>OCR 后端</label>
         <select id="fBackend">
-          <option value="glm-ocr">glm-ocr（Ollama 视觉模型，推荐）</option>
+          <option value="paddle-layout">paddle-layout（Paddle 版面分析 + glm-ocr，推荐扫描件）</option>
+          <option value="glm-ocr">glm-ocr（整页视觉 OCR）</option>
           <option value="mineru">mineru CLI（本机 MinerU，精度高）</option>
           <option value="text-layer">直接抽文字层（非扫描件，秒出）</option>
           <option value="stub">stub（空跑，仅验证流程）</option>
@@ -145,8 +146,8 @@
     </div>
 
     <div class="row">
-      <label class="chk"><input type="checkbox" id="fProof"/> 转换后用文本模型校对（慢，但错字更少）</label>
-      <input id="fProofModel" placeholder="校对模型，如 qwen14b-pro" style="max-width:230px"/>
+      <label class="chk"><input type="checkbox" id="fProof" checked/> 转换后用文本模型校对（慢，但错字更少）</label>
+      <input id="fProofModel" value="qwen14b-pro" placeholder="校对模型，如 qwen14b-pro" style="max-width:230px"/>
       <label class="chk"><input type="checkbox" id="fForce"/> 忽略已有进度，全部重跑</label>
     </div>
     <div class="hint" id="modeHint">

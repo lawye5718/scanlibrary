@@ -488,6 +488,15 @@ def strip_noise_lines(text: str) -> str:
             continue
         if re.fullmatch(r"[·•\-.。…_=\s]{4,}", line):
             continue
+        compact = re.sub(r"\s+", "", line)
+        if re.fullmatch(r"[\W_]+", compact) and len(compact) >= 2:
+            continue
+        if re.search(r"(.{1,8})\1{3,}", compact):
+            continue
+        meaningful = text_char_count(line)
+        non_space = len(compact)
+        if non_space >= 8 and meaningful / max(1, non_space) < 0.22:
+            continue
         kept.append(raw)
     return "\n".join(kept).strip()
 
@@ -534,15 +543,51 @@ def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
 def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
     paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
     out = []
+    recent_norms = []
     for para in paras:
+        para = re.sub(r"(.{12,260}?)(?:\s*\1){1,}", r"\1", para)
+        norm = re.sub(rf"[^\w{CJK}]+", "", para)
+        if len(norm) >= 80:
+            dup_recent = False
+            for prev_norm in recent_norms[-8:]:
+                if prev_norm == norm:
+                    dup_recent = True
+                    break
+                if prev_norm and difflib.SequenceMatcher(None, prev_norm, norm).ratio() >= 0.985:
+                    dup_recent = True
+                    break
+            if dup_recent:
+                continue
         if out:
             prev = out[-1]
             score = difflib.SequenceMatcher(None, prev, para).ratio()
             shorter = min(len(prev), len(para))
             if (shorter >= 20 and score >= similarity) or (shorter >= 40 and (prev in para or para in prev)):
                 continue
-        out.append(re.sub(r"(.{12,200}?)(?:\s*\1){1,}", r"\1", para))
+        out.append(para)
+        recent_norms.append(norm)
     return "\n\n".join(out)
+
+
+def normalized_text_for_dedup(text: str) -> str:
+    return re.sub(rf"[^\w{CJK}]+", "", text or "")
+
+
+def looks_like_duplicate_page(text: str, recent_norms: list[str], similarity=0.99) -> bool:
+    norm = normalized_text_for_dedup(text)
+    if len(norm) < 120:
+        return False
+    for prev in recent_norms[-4:]:
+        if not prev:
+            continue
+        if norm == prev:
+            return True
+        shorter = min(len(norm), len(prev))
+        if shorter >= 120 and (norm in prev or prev in norm):
+            return True
+        if difflib.SequenceMatcher(None, prev, norm).ratio() >= similarity:
+            return True
+    return False
 
 
 def render_note_refs_as_text(text: str) -> str:
@@ -977,22 +1022,29 @@ def split_chapters(text):
 # Markdown → XHTML（极简转换器，够 EPUB 用）
 # ---------------------------------------------------------------------------
 
-def inline_md(s):
+def inline_md(s, note_href_builder=None, note_ref_id_builder=None):
     s = html.escape(s, quote=False)
     s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
     s = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", s)
     s = re.sub(r"`(.+?)`", r"<code>\1</code>", s)
-    s = re.sub(
-        r"\[\[NOTE_REF:(\d+)\|(.+?)\]\]",
-        r'<a id="note-ref-\1" epub:type="noteref" class="noteref" href="notes.xhtml#note-\1">\2</a>',
-        s,
-    )
+
+    def repl_note_ref(m):
+        nid = m.group(1)
+        label = m.group(2)
+        href = note_href_builder(nid) if note_href_builder else f"notes.xhtml#note-{nid}"
+        ref_id = note_ref_id_builder(nid) if note_ref_id_builder else f"note-ref-{nid}"
+        return (
+            f'<a id="{html.escape(ref_id, quote=True)}" epub:type="noteref" class="noteref" '
+            f'href="{html.escape(href, quote=True)}">{label}</a>'
+        )
+
+    s = re.sub(r"\[\[NOTE_REF:(\d+)\|(.+?)\]\]", repl_note_ref, s)
     s = re.sub(r"!\[(.*?)\]\((.*?)\)", r'<img alt="\1" src="\2"/>', s)
     s = re.sub(r"\[(.+?)\]\((.+?)\)", r'<a href="\2">\1</a>', s)
     return s
 
 
-def md_to_xhtml(md):
+def md_to_xhtml(md, note_href_builder=None, note_ref_id_builder=None):
     lines = md.split("\n")
     out = []
     in_list = False
@@ -1002,7 +1054,10 @@ def md_to_xhtml(md):
     def flush_para():
         nonlocal para
         if para:
-            out.append("<p>" + "<br/>".join(inline_md(l) for l in para) + "</p>")
+            out.append("<p>" + "<br/>".join(
+                inline_md(l, note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)
+                for l in para
+            ) + "</p>")
             para = []
 
     for raw in lines:
@@ -1024,12 +1079,17 @@ def md_to_xhtml(md):
                 out.append("</ul>")
                 in_list = False
             lvl = min(6, len(m.group(1)))
-            out.append(f"<h{lvl}>{inline_md(m.group(2))}</h{lvl}>")
+            out.append(
+                f"<h{lvl}>{inline_md(m.group(2), note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)}</h{lvl}>"
+            )
             continue
         if re.match(r"^\|", s):
             flush_para()
             cells = [c.strip() for c in s.strip("|").split("|")]
-            out.append("<p>" + " ｜ ".join(inline_md(c) for c in cells) + "</p>")
+            out.append("<p>" + " ｜ ".join(
+                inline_md(c, note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)
+                for c in cells
+            ) + "</p>")
             continue
         if re.match(r"^([-*+]|\d+\.)\s+", s):
             flush_para()
@@ -1037,14 +1097,16 @@ def md_to_xhtml(md):
                 out.append("<ul>")
                 in_list = True
             item = re.sub(r"^([-*+]|\d+\.)\s+", "", s)
-            out.append(f"<li>{inline_md(item)}</li>")
+            out.append(f"<li>{inline_md(item, note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)}</li>")
             continue
         if s.startswith(">"):
             if not in_quote:
                 flush_para()
                 out.append("<blockquote>")
                 in_quote = True
-            out.append(f"<p>{inline_md(s.lstrip('> '))}</p>")
+            out.append(
+                f"<p>{inline_md(s.lstrip('> '), note_href_builder=note_href_builder, note_ref_id_builder=note_ref_id_builder)}</p>"
+            )
             continue
         if re.match(r"^(-{3,}|\*{3,})$", s):
             flush_para()
@@ -1079,7 +1141,7 @@ img{max-width:100%;display:block;margin:1em auto;}
 
 
 def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_dir: Path | None = None, notes=None):
-    """把章节、插图、注释打成 EPUB3。"""
+    """把章节、插图、注释打成 EPUB3。注释附在各章末尾。"""
     epub_path.parent.mkdir(parents=True, exist_ok=True)
     bookid = f"urn:uuid:{uuid.uuid4()}"
     modified = now_iso()
@@ -1110,8 +1172,45 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
         for i, chapter in enumerate(chapters):
             ctitle = chapter["title"]
             body = chapter["body"]
+            chapter_notes = chapter.get("notes") or []
             fname = f"chap_{i + 1:04d}.xhtml"
-            xhtml = md_to_xhtml(body)
+            body_for_render = body if chapter_notes else render_note_refs_as_text(body)
+            note_ref_counts = {}
+            note_backrefs = {}
+
+            def note_ref_id_builder(nid: str) -> str:
+                count = note_ref_counts.get(nid, 0) + 1
+                note_ref_counts[nid] = count
+                ref_id = f"note-ref-{nid}-{count}"
+                note_backrefs.setdefault(int(nid), []).append(ref_id)
+                return ref_id
+
+            xhtml = md_to_xhtml(
+                body_for_render,
+                note_href_builder=(lambda nid: f"#note-{nid}"),
+                note_ref_id_builder=note_ref_id_builder,
+            )
+            note_html = ""
+            if chapter_notes:
+                note_lines = ['<section class="chapter-notes" epub:type="endnotes">', '<h3>注释</h3>']
+                for note in chapter_notes:
+                    label = html.escape(note.get("label") or f"[{note['id']}]")
+                    text = inline_md(note.get("text", ""))
+                    backrefs = note_backrefs.get(note["id"], [])
+                    if backrefs:
+                        backref_html = " ".join(
+                            f'<a class="backref" aria-label="返回正文中的注释引用" href="#{html.escape(ref_id, quote=True)}">'
+                            f'返回正文{"" if idx == 1 else idx}</a>'
+                            for idx, ref_id in enumerate(backrefs, 1)
+                        )
+                    else:
+                        backref_html = f'<a class="backref" aria-label="返回本章开头" href="#chapter-{i + 1}">返回本章</a>'
+                    note_lines.append(
+                        f'<p id="note-{note["id"]}" epub:type="endnote"><strong>{label}</strong> {text}'
+                        f' {backref_html}</p>'
+                    )
+                note_lines.append("</section>")
+                note_html = "\n".join(note_lines)
             body_class = ' class="illustration-page"' if chapter.get("illustration_only") else ""
             doc = (
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1119,34 +1218,12 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
                 '<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="%s">\n'
                 '<head><meta charset="utf-8"/><title>%s</title>'
                 '<link rel="stylesheet" type="text/css" href="style.css"/></head>\n'
-                '<body%s>\n<h2 id="chapter-%d">%s</h2>\n%s\n</body>\n</html>\n'
-            ) % (lang, html.escape(ctitle), body_class, i + 1, html.escape(ctitle), xhtml)
+                '<body%s>\n<h2 id="chapter-%d">%s</h2>\n%s\n%s\n</body>\n</html>\n'
+            ) % (lang, html.escape(ctitle), body_class, i + 1, html.escape(ctitle), xhtml, note_html)
             z.writestr(f"OEBPS/{fname}", doc)
             manifest.append(f'    <item id="c{i + 1}" href="{fname}" media-type="application/xhtml+xml"/>')
             spine.append(f'    <itemref idref="c{i + 1}"/>')
             nav_items.append((ctitle, fname))
-
-        if notes:
-            note_lines = [
-                '<?xml version="1.0" encoding="UTF-8"?>',
-                '<!DOCTYPE html>',
-                f'<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{lang}">',
-                '<head><meta charset="utf-8"/><title>注释</title><link rel="stylesheet" type="text/css" href="style.css"/></head>',
-                '<body class="notes"><h2>注释</h2>',
-            ]
-            for note in notes:
-                label = html.escape(note.get("label") or f"[{note['id']}]")
-                text = inline_md(note.get("text", ""))
-                chapter_href = html.escape(note.get("chapter_href", "nav.xhtml"))
-                note_lines.append(
-                    f'<p id="note-{note["id"]}"><strong>{label}</strong> {text}'
-                    f'<a class="backref" aria-label="返回正文中的注释引用" '
-                    f'href="{chapter_href}#note-ref-{note["id"]}">返回正文（{label}）</a></p>'
-                )
-            note_lines += ['</body>', '</html>', '']
-            z.writestr("OEBPS/notes.xhtml", "\n".join(note_lines))
-            manifest.append('    <item id="notes" href="notes.xhtml" media-type="application/xhtml+xml"/>')
-            nav_items.append(("注释", "notes.xhtml"))
 
         nav = ['<?xml version="1.0" encoding="UTF-8"?>',
                '<!DOCTYPE html>',
@@ -1208,7 +1285,8 @@ PROOFREAD_PROMPT = """你是古籍/中文图书校对助手。下面是一段 OC
 请只做以下修正，不要改写、不要润色、不要增删内容、不要加解释：
 1. 修正明显的 OCR 错字（尤其是形近字、繁简混排、标点）；
 2. 修正错误的断行，让句子完整；
-3. 保持原文的人名、地名、数字与专业术语不变。
+3. 删除明显无意义的乱码符号、重复词句与重复段落；
+4. 保持原文的人名、地名、数字与专业术语不变。
 直接输出修正后的正文，不要任何开头说明。
 
 正文：
@@ -1336,14 +1414,20 @@ def run_job(job_id):
                 log(job_id, f"识别到 {len(junk)} 条页眉/页脚，已移除")
             ordered = [strip_junk(t, junk) for t in ordered]
         processed = []
+        recent_page_norms = []
         for pno, text in zip(ordered_keys, ordered):
             if text.startswith("!["):
                 processed.append({"page": pno, "text": text, "illustration": True})
                 continue
             body_text, notes, next_note_id = extract_footnotes_from_page(text, pno, next_note_id)
+            body_text = strip_noise_lines(body_text)
             body_text = collapse_repeated_paragraphs(merge_wrapped_lines(body_text))
+            if looks_like_duplicate_page(body_text, recent_page_norms):
+                log(job_id, f"第 {pno} 页正文与前页重复，已剔除")
+                continue
             if body_text:
                 processed.append({"page": pno, "text": body_text, "illustration": False})
+                recent_page_norms.append(normalized_text_for_dedup(body_text))
             if notes:
                 all_notes.extend(notes)
         full = "\n\n".join(item["text"] for item in processed if item["text"])
@@ -1361,7 +1445,8 @@ def run_job(job_id):
 
         # ---- 4. 可选：用已装的文本模型做校对 ----
         if cfg.get("proofread"):
-            model = cfg.get("proof_model", "")
+            model = (cfg.get("proof_model") or "").strip() or "qwen14b-pro"
+            cfg["proof_model"] = model
             if not model:
                 log(job_id, "未填写校对模型，跳过校对")
             else:
@@ -1401,37 +1486,39 @@ def run_job(job_id):
         log(job_id, "切分章节并生成 EPUB")
         raw_chapters = split_chapters(full)
         chapters = []
-        epub_notes = []
-        epub_note_ids = set()
-        for title0, body0 in raw_chapters:
+        implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
+        if implicit_single:
+            title0 = raw_chapters[0][0] or "正文"
+            body0 = raw_chapters[0][1]
             chapter_notes = collect_note_refs_for_epub(body0, all_notes)
-            idx = len(chapters) + 1
-            fname = f"chap_{idx:04d}.xhtml"
-            for note in chapter_notes:
-                if note["id"] not in epub_note_ids:
-                    epub_notes.append({**note, "chapter_href": fname})
-                    epub_note_ids.add(note["id"])
-            chapters.append({
+            chapters = [{
                 "title": title0,
                 "body": body0,
+                "notes": chapter_notes,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
-            })
+            }]
+        else:
+            for title0, body0 in raw_chapters:
+                chapter_notes = collect_note_refs_for_epub(body0, all_notes)
+                chapters.append({
+                    "title": title0,
+                    "body": body0,
+                    "notes": chapter_notes,
+                    "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", body0 or "")),
+                })
         if not chapters:
             chapter_notes = collect_note_refs_for_epub(full, all_notes)
-            for note in chapter_notes:
-                if note["id"] not in epub_note_ids:
-                    epub_notes.append({**note, "chapter_href": "chap_0001.xhtml"})
-                    epub_note_ids.add(note["id"])
             chapters = [{
                 "title": "正文",
                 "body": full,
+                "notes": chapter_notes,
                 "illustration_only": bool(re.fullmatch(r"\s*!\[.*?\]\(images/.*?\)\s*", full or "")),
             }]
         # 测试版单独命名，不覆盖全书版 EPUB
         epub_name = f"{slug}-试读版.epub" if cfg.get("mode") == "test" else f"{slug}.epub"
         epub = book_dir / epub_name
         build_epub(epub, job["title"], job.get("author", ""), chapters,
-                   lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir, notes=epub_notes)
+                   lang=cfg.get("lang", "zh-CN"), assets_dir=images_dir)
         md_out = book_dir / f"{slug}.md"
         md_src = book_dir / ("book.proofread.md" if cfg.get("proofread") and (book_dir / "book.proofread.md").exists() else "book.md")
         if md_src != md_out:
@@ -1680,6 +1767,8 @@ class Handler(BaseHTTPRequestHandler):
                     cfg = json.loads(base64.b64decode(cfg_raw))
             except Exception:
                 cfg = {}
+            if cfg.get("proofread") and not (cfg.get("proof_model") or "").strip():
+                cfg["proof_model"] = "qwen14b-pro"
             job_id = str(uuid.uuid4())
 
             fname = None
