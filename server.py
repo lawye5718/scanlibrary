@@ -81,7 +81,7 @@ NO_TEXT_TOKEN = "〔无文字〕"
 # 丢弃：规则化移除，永远不进正文
 PADDLE_DROP_LABELS = frozenset({"header", "footer", "page_number", "seal"})
 # 嵌入：保留为 jpg 图，markdown 引用
-PADDLE_FIGURE_LABELS = frozenset({"figure", "chart"})
+PADDLE_FIGURE_LABELS = frozenset({"figure", "chart", "image", "picture", "img", "photo"})
 # 资产图：表格/公式以图片形式嵌入（不强求 OCR 还原复杂排版）
 PADDLE_ASSET_LABELS = frozenset({"table", "formula", "equation"})
 # 文本：裁剪后调 glm-ocr
@@ -548,6 +548,7 @@ NOTE_MARKER_RE = re.compile(
 
 # 行首圈码（①②③…）常表示一条新注释，OCR 却只给单换行，需提升为段落边界
 NOTE_LINE_SPLIT_RE = re.compile(r"\n(?=\s*[\u2460-\u2473])")
+IMAGE_MARKER_RE = re.compile(r"^!\[(.*?)\]\((.*?)\)$")
 
 
 def _split_notes_into_paras(text: str) -> str:
@@ -594,6 +595,13 @@ def extract_footnotes_from_page(text: str, page_no: int, next_note_id: int):
     return "\n\n".join(body).strip(), notes, next_note_id
 
 
+def relabel_note_refs(text: str, label_by_id: dict[int, str]) -> str:
+    def repl(m):
+        nid = int(m.group(1))
+        return f"[[NOTE_REF:{nid}|{label_by_id.get(nid, m.group(2))}]]"
+    return NOTE_REF_RE.sub(repl, text or "")
+
+
 def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
     paras = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
     out = []
@@ -601,6 +609,8 @@ def collapse_repeated_paragraphs(text: str, similarity=0.88) -> str:
     for para in paras:
         para = re.sub(r"(.{12,260}?)(?:\s*\1){1,}", r"\1", para)
         norm = re.sub(rf"[^\w{CJK}]+", "", para)
+        if norm and any(prev_norm == norm for prev_norm in recent_norms[-8:]):
+            continue
         if len(norm) >= 80:
             dup_recent = False
             for prev_norm in recent_norms[-8:]:
@@ -659,6 +669,58 @@ def collect_note_refs_for_epub(text: str, notes: list[dict]) -> list[dict]:
             chapter_notes.append(note)
             seen.add(nid)
     return chapter_notes
+
+
+def join_processed_pages(processed: list[dict]) -> str:
+    out = []
+    prev = None
+    for item in processed:
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        if not out:
+            out.append(text)
+            prev = item
+            continue
+        cur_first = text.split("\n", 1)[0].strip()
+        sep = "\n\n" if prev and (prev.get("illustration") or item.get("illustration")) else "\n"
+        if is_chapter_line(cur_first) or IMAGE_MARKER_RE.match(cur_first):
+            sep = "\n\n"
+        out.append(sep + text)
+        prev = item
+    return "".join(out).strip()
+
+
+def dedupe_layout_parts(parts: list[tuple[int, int, str]], similarity=0.985):
+    out = []
+    recent_norms = []
+    recent_markers = []
+    for y1, x1, content in sorted(parts, key=lambda p: (p[0], p[1])):
+        s = (content or "").strip()
+        if not s:
+            continue
+        if IMAGE_MARKER_RE.match(s):
+            if s in recent_markers[-12:]:
+                continue
+            out.append((y1, x1, s))
+            recent_markers.append(s)
+            continue
+        norm = normalized_text_for_dedup(render_note_refs_as_text(s))
+        if not norm:
+            continue
+        dup = False
+        for prev_norm in recent_norms[-8:]:
+            if prev_norm == norm:
+                dup = True
+                break
+            if min(len(prev_norm), len(norm)) >= 30 and difflib.SequenceMatcher(None, prev_norm, norm).ratio() >= similarity:
+                dup = True
+                break
+        if dup:
+            continue
+        out.append((y1, x1, s))
+        recent_norms.append(norm)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +953,39 @@ def _bbox_cover(outer, inner) -> float:
     return inter / inner_area if inner_area > 0 else 0.0
 
 
+def _layout_label_kind(label: str) -> str:
+    if label in PADDLE_FIGURE_LABELS or label in PADDLE_ASSET_LABELS:
+        return "visual"
+    if label in PADDLE_DROP_LABELS:
+        return "drop"
+    return "text"
+
+
+def _layout_label_priority(label: str) -> int:
+    kind = _layout_label_kind(label)
+    if kind == "visual":
+        return 3
+    if kind == "text":
+        return 2
+    return 1
+
+
+def normalize_layout_boxes(boxes):
+    out = []
+    for b in boxes or []:
+        label = str((b or {}).get("label", "")).strip().lower()
+        bb = (b or {}).get("bbox")
+        if not bb or len(bb) != 4:
+            continue
+        try:
+            score = float((b or {}).get("score", 0.0) or 0.0)
+            bbox = [float(c) for c in bb]
+        except Exception:
+            continue
+        out.append({"label": label, "score": score, "bbox": bbox})
+    return out
+
+
 def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
     """丢弃互相重叠的版面框。
 
@@ -903,17 +998,48 @@ def dedupe_overlapping_boxes(boxes, iou_thr=0.5, cover_thr=0.85):
         x1, y1, x2, y2 = b["bbox"]
         return max(0, x2 - x1) * max(0, y2 - y1)
 
-    ordered = sorted(boxes, key=_area, reverse=True)
+    ordered = sorted(
+        normalize_layout_boxes(boxes),
+        key=lambda b: (_layout_label_priority(b.get("label", "")), _area(b)),
+        reverse=True,
+    )
     kept = []
     for b in ordered:
         bb = b.get("bbox")
-        if not bb or len(bb) != 4:
-            continue
-        if any(_bbox_iou(bb, k["bbox"]) >= iou_thr or _bbox_cover(k["bbox"], bb) >= cover_thr
-               for k in kept):
+        label = b.get("label", "")
+        kind = _layout_label_kind(label)
+        drop = False
+        for k in kept:
+            overlap = _bbox_iou(bb, k["bbox"]) >= iou_thr or _bbox_cover(k["bbox"], bb) >= cover_thr
+            if not overlap:
+                continue
+            kept_label = k.get("label", "")
+            kept_kind = _layout_label_kind(kept_label)
+            if kind == "visual" and kept_kind != "visual":
+                continue
+            if _layout_label_priority(kept_label) >= _layout_label_priority(label):
+                drop = True
+                break
+        if drop:
             continue
         kept.append(b)
     return kept
+
+
+def should_keep_visual_box(label: str, score: float, x1: int, y1: int, x2: int, y2: int, page_w: int, page_h: int) -> bool:
+    width = max(0, x2 - x1)
+    height = max(0, y2 - y1)
+    area = width * height
+    page_area = max(1, page_w * page_h)
+    area_ratio = area / page_area
+    min_score = 0.2 if label in PADDLE_FIGURE_LABELS else 0.25
+    if score and score < min_score:
+        return False
+    if width < 48 or height < 48:
+        return False
+    if area_ratio < 0.008 and max(width, height) < 180:
+        return False
+    return True
 
 
 def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
@@ -941,8 +1067,10 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
     img = Image.open(img_path).convert("RGB")
     W, H = img.size
     parts = []
+    visual_count = 0
     for idx, b in enumerate(boxes):
-        label = b.get("label", "")
+        label = str(b.get("label", "")).strip().lower()
+        score = float(b.get("score", 0.0) or 0.0)
         try:
             x1, y1, x2, y2 = (int(round(c)) for c in b["bbox"])
         except Exception:
@@ -958,18 +1086,24 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
         base_stem = f"{img_path.stem}_p{idx}"
 
         if label in PADDLE_FIGURE_LABELS:
+            if visual_count >= 24 or not should_keep_visual_box(label, score, x1, y1, x2, y2, W, H):
+                continue
             fig_path = img_path.parent / f"{base_stem}.jpg"
             try:
                 crop.save(fig_path, "JPEG", quality=85)
                 parts.append((y1, x1, image_marker_md(fig_path, "插图")))
+                visual_count += 1
             except Exception:
                 pass
             continue
         if label in PADDLE_ASSET_LABELS:
+            if visual_count >= 24 or not should_keep_visual_box(label, score, x1, y1, x2, y2, W, H):
+                continue
             asset_path = img_path.parent / f"{base_stem}_{label}.jpg"
             try:
                 crop.save(asset_path, "JPEG", quality=90)
                 parts.append((y1, x1, image_marker_md(asset_path, label)))
+                visual_count += 1
             except Exception:
                 pass
             continue
@@ -986,7 +1120,7 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
             try: tmp_path.unlink()
             except Exception: pass
 
-    parts.sort(key=lambda p: (p[0], p[1]))
+    parts = dedupe_layout_parts(parts)
     return "\n\n".join(p[2] for p in parts) if parts else NO_TEXT_TOKEN
 
 
@@ -1131,7 +1265,10 @@ def merge_wrapped_lines(text):
                 buf = ""
             out.append("")
             continue
-        if re.match(r"^[#>\-\*\|`\d]+\s?", line) or re.match(r"^\|", line) or is_chapter_line(line):
+        if (re.match(r"^[#>\-\*\|`\d]+\s?", line)
+                or re.match(r"^\|", line)
+                or is_chapter_line(line)
+                or IMAGE_MARKER_RE.match(line)):
             # 标题 / 列表 / 表格 / 引用：自成一段，不与相邻行合并
             if buf:
                 out.append(buf)
@@ -1354,7 +1491,14 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             body = chapter["body"]
             chapter_notes = chapter.get("notes") or []
             fname = f"chap_{i + 1:04d}.xhtml"
-            body_for_render = body if chapter_notes else render_note_refs_as_text(body)
+            chapter_note_labels = {
+                note["id"]: f"[{idx}]"
+                for idx, note in enumerate(chapter_notes, 1)
+            }
+            body_for_render = (
+                relabel_note_refs(body, chapter_note_labels) if chapter_notes
+                else render_note_refs_as_text(body)
+            )
             note_ref_counts = {}
             note_backrefs = {}
 
@@ -1374,7 +1518,7 @@ def build_epub(epub_path: Path, title, author, chapters, lang="zh-CN", assets_di
             if chapter_notes:
                 note_lines = ['<section class="chapter-notes" epub:type="endnotes">', '<h3>注释</h3>']
                 for note in chapter_notes:
-                    label = html.escape(note.get("label") or f"[{note['id']}]")
+                    label = html.escape(chapter_note_labels.get(note["id"], note.get("label") or f"[{note['id']}]"))
                     text = inline_md(note.get("text", ""))
                     backrefs = note_backrefs.get(note["id"], [])
                     if backrefs:
@@ -2053,8 +2197,8 @@ def run_job(job_id):
                 recent_page_norms.append(normalized_text_for_dedup(body_text))
             if notes:
                 all_notes.extend(notes)
-        full = "\n\n".join(item["text"] for item in processed if item["text"])
-        full = collapse_repeated_paragraphs(full)
+        full = join_processed_pages(processed)
+        full = collapse_repeated_paragraphs(merge_wrapped_lines(full))
         notes_md = notes_block(all_notes)
         book_md = render_note_refs_as_text(full)
         if notes_md:

@@ -210,6 +210,11 @@ body_text2, notes2, _ = server.extract_footnotes_from_page(
     "第一章 起始\n\n1. 研究背景\n\n这里继续正文。", 2, 10
 )
 assert "1. 研究背景" in body_text2 and not notes2, "正文编号段落不应被误抽成注释"
+stitched = server.merge_wrapped_lines(server.join_processed_pages([
+    {"page": 1, "text": "这一段跨页未完", "illustration": False},
+    {"page": 2, "text": "下一页接着写完。\n\n新一段。", "illustration": False},
+]))
+assert stitched.split("\n") == ["这一段跨页未完下一页接着写完。", "", "新一段。"], stitched
 print("✅ 注释抽取不会打乱正文")
 
 # EPUB 图片路径：正文中的插图必须指向 OEBPS/images/ 下的资源
@@ -225,6 +230,26 @@ with zipfile.ZipFile(tmp_epub) as z:
     assert 'src="images/plate.jpg"' in chap, chap
 print("✅ EPUB 插图路径正确")
 
+notes_epub = ROOT / "books" / "注释重编.epub"
+server.build_epub(
+    notes_epub,
+    "注释重编",
+    "测试作者",
+    [{
+        "title": "正文",
+        "body": "正文[[NOTE_REF:7|③]]继续[[NOTE_REF:8|⑩]]。",
+        "notes": [
+            {"id": 7, "label": "③", "text": "第三条原始注释"},
+            {"id": 8, "label": "⑩", "text": "第十条原始注释"},
+        ],
+    }],
+)
+with zipfile.ZipFile(notes_epub) as z:
+    chap = z.read("OEBPS/chap_0001.xhtml").decode("utf-8")
+    assert 'href="#note-7">[1]</a>' in chap and '<strong>[1]</strong> 第三条原始注释' in chap, chap
+    assert 'href="#note-8">[2]</a>' in chap and '<strong>[2]</strong> 第十条原始注释' in chap, chap
+print("✅ EPUB 注释按章重编号")
+
 if server.Image is not None:
     probe = ROOT / "paddle-probe.jpg"
     server.Image.new("RGB", (240, 240), "white").save(probe, "JPEG")
@@ -239,6 +264,16 @@ if server.Image is not None:
         mixed = server.ocr_page_paddle_glm({}, probe)
         assert mixed.split("\n\n") == ["正文[1]", "[1] 这是脚注"], mixed
         print("✅ paddle-layout 保留脚注文本顺序")
+
+        server.paddle_layout_detect = lambda _p: [
+            {"label": "Text", "bbox": [0, 0, 220, 220], "score": 0.99},
+            {"label": "Image", "bbox": [20, 20, 200, 170], "score": 0.95},
+            {"label": "figure", "bbox": [5, 5, 35, 35], "score": 0.99},
+        ]
+        server.ocr_page_glmocr = lambda _cfg, p, attempt=1: "正文段落" if p.stem.endswith("_crop") else ""
+        mixed = server.ocr_page_paddle_glm({}, probe)
+        assert "正文段落" in mixed and mixed.count("![") == 1, mixed
+        print("✅ paddle-layout 保留真实插图并过滤伪图")
     finally:
         server.paddle_layout_detect = old_detect
         server.ocr_page_glmocr = old_ocr
