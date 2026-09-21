@@ -77,7 +77,7 @@ NO_TEXT_TOKEN = "〔无文字〕"
 
 # ---- PP-DocLayout_plus-L 类别映射（仅 paddle-layout 后端使用）----
 # 丢弃：规则化移除，永远不进正文
-PADDLE_DROP_LABELS = frozenset({"header", "footer", "page_number", "footnote", "footnote_content", "seal"})
+PADDLE_DROP_LABELS = frozenset({"header", "footer", "page_number", "seal"})
 # 嵌入：保留为 jpg 图，markdown 引用
 PADDLE_FIGURE_LABELS = frozenset({"figure", "chart"})
 # 资产图：表格/公式以图片形式嵌入（不强求 OCR 还原复杂排版）
@@ -766,7 +766,7 @@ def ocr_page_paddle_glm(cfg, img_path: Path) -> str:
     try:
         boxes = paddle_layout_detect(img_path)
     except Exception as e:
-        return f"（版面分析失败：{e}）"
+        raise RuntimeError(f"版面分析失败：{e}") from e
     if not boxes:
         return NO_TEXT_TOKEN
 

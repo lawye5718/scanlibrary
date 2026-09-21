@@ -150,6 +150,24 @@ with zipfile.ZipFile(tmp_epub) as z:
     assert 'src="images/plate.jpg"' in chap, chap
 print("✅ EPUB 插图路径正确")
 
+if server.Image is not None:
+    probe = ROOT / "paddle-probe.jpg"
+    server.Image.new("RGB", (240, 240), "white").save(probe, "JPEG")
+    old_detect = server.paddle_layout_detect
+    old_ocr = server.ocr_page_glmocr
+    try:
+        server.paddle_layout_detect = lambda _p: [
+            {"label": "text", "bbox": [0, 0, 220, 100]},
+            {"label": "footnote_content", "bbox": [0, 120, 220, 220]},
+        ]
+        server.ocr_page_glmocr = lambda _cfg, p, attempt=1: "正文[1]" if "_p0_" in p.stem else "[1] 这是脚注"
+        mixed = server.ocr_page_paddle_glm({}, probe)
+        assert mixed.split("\n\n") == ["正文[1]", "[1] 这是脚注"], mixed
+        print("✅ paddle-layout 保留脚注文本顺序")
+    finally:
+        server.paddle_layout_detect = old_detect
+        server.ocr_page_glmocr = old_ocr
+
 # pandoc 读回验证（可选，缺 pandoc 不算失败）
 try:
     p = subprocess.run(["pandoc", str(epub_path), "-t", "plain"], capture_output=True, text=True)
