@@ -22,6 +22,7 @@ ScanLibrary —— 本地扫描书 → 可重排 EPUB 工作台
 
 import argparse
 import base64
+import bisect
 import difflib
 import html
 import json
@@ -450,7 +451,7 @@ def extract_pdf_outline_chapters(pdf_path: Path, page_range=None):
             continue
         if lv != chapter_level or page < 1 or page > total:
             continue
-        title = re.sub(r"\s+", " ", str(raw_title or "")).strip()
+        title = normalize_pdf_chapter_title(raw_title)
         if not title:
             continue
         key = (title, page)
@@ -484,6 +485,13 @@ def extract_pdf_outline_chapters(pdf_path: Path, page_range=None):
             "end_page": min(r1, end_page),
         })
     return chapters
+
+
+def normalize_pdf_chapter_title(title: str) -> str:
+    s = re.sub(r"\s+", " ", str(title or "")).strip()
+    s = s.lstrip("#").strip()
+    s = re.sub(r"^[\-\*\d.\s、]+", "", s).strip()
+    return s
 
 
 def text_char_count(text: str) -> int:
@@ -775,46 +783,51 @@ def split_chapters_by_pdf_toc(processed: list[dict], toc_chapters: list[dict]) -
     """按 PDF 目录页码把已处理页面拼成章节。"""
     if not processed or not toc_chapters:
         return []
-    pages = sorted(p for p in processed if (p.get("text") or "").strip())
+    pages = sorted(
+        (p for p in processed if (p.get("text") or "").strip()),
+        key=lambda p: int(p.get("page", 0)),
+    )
     if not pages:
         return []
-    first_page = pages[0]["page"]
-    last_page = pages[-1]["page"]
+    page_nums = [int(p.get("page", 0)) for p in pages]
+    first_page = page_nums[0]
+    last_page = page_nums[-1]
 
     chapter_specs = []
-    last_end = first_page - 1
+    used_until = -1
     for item in sorted(toc_chapters, key=lambda x: x.get("start_page", 0)):
         title = (item.get("title") or "").strip() or "正文"
         start = max(first_page, int(item.get("start_page", first_page)))
         end = min(last_page, int(item.get("end_page", last_page)))
         if end < start:
             continue
-        if start <= last_end:
-            start = last_end + 1
-        if start > end:
+        left = bisect.bisect_left(page_nums, start)
+        right = bisect.bisect_right(page_nums, end) - 1
+        if left >= len(page_nums) or right < left:
             continue
-        chapter_specs.append((title, start, end))
-        last_end = end
+        left = max(left, used_until + 1)
+        if left > right:
+            continue
+        chapter_specs.append((title, left, right))
+        used_until = right
 
     if not chapter_specs:
         return []
 
     out = []
-    cursor = first_page
-    for title, start, end in chapter_specs:
-        if cursor < start:
-            pref_items = [p for p in pages if cursor <= p["page"] < start]
-            pref_body = join_processed_pages(pref_items)
+    cursor = 0
+    for title, start_idx, end_idx in chapter_specs:
+        if cursor < start_idx:
+            pref_body = join_processed_pages(pages[cursor:start_idx])
             if pref_body:
                 out.append(("前言" if not out else "正文", pref_body))
-        body_items = [p for p in pages if start <= p["page"] <= end]
+        body_items = pages[start_idx:end_idx + 1]
         body = join_processed_pages(body_items)
         if body:
             out.append((title, body))
-        cursor = end + 1
-    if cursor <= last_page:
-        tail_items = [p for p in pages if cursor <= p["page"] <= last_page]
-        tail = join_processed_pages(tail_items)
+        cursor = end_idx + 1
+    if cursor < len(pages):
+        tail = join_processed_pages(pages[cursor:])
         if tail:
             out.append(("正文", tail))
     return out
@@ -2093,7 +2106,7 @@ def build_epub_from_source(full, notes, book_dir, slug, title, author, cfg,
     返回 (epub_path, chapters)。
     """
     notes = notes or []
-    raw_chapters = prebuilt_chapters or split_chapters(full)
+    raw_chapters = prebuilt_chapters if prebuilt_chapters is not None else split_chapters(full)
     chapters = []
     implicit_single = len(raw_chapters) == 1 and (raw_chapters[0][0] or "").strip() == "正文"
     if implicit_single:
@@ -2228,7 +2241,9 @@ def run_job(job_id):
         page_texts = {}
         all_notes = []
         next_note_id = 1
-        pdf_toc_chapters = extract_pdf_outline_chapters(pdf_path, cfg.get("page_range"))
+        pdf_toc_chapters = []
+        if str(pdf_path).lower().endswith(".pdf"):
+            pdf_toc_chapters = extract_pdf_outline_chapters(pdf_path, cfg.get("page_range"))
         if pdf_toc_chapters:
             log(job_id, f"识别到 PDF 目录章节 {len(pdf_toc_chapters)} 条，将按目录切章")
 
@@ -2367,16 +2382,25 @@ def run_job(job_id):
                 recent_page_norms.append(normalized_text_for_dedup(body_text))
             if notes:
                 all_notes.extend(notes)
-        toc_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters) if pdf_toc_chapters else []
-        if toc_chapters:
-            full = "\n\n".join(
-                f"# {title.strip() or '正文'}\n\n{body}".strip()
-                for title, body in toc_chapters
+        raw_toc_chapters = split_chapters_by_pdf_toc(processed, pdf_toc_chapters) if pdf_toc_chapters else []
+        normalized_toc_chapters = []
+        if raw_toc_chapters:
+            normalized_toc_chapters = [
+                (normalize_pdf_chapter_title(title) or "正文", collapse_repeated_paragraphs(merge_wrapped_lines(body)))
+                for title, body in raw_toc_chapters
                 if (body or "").strip()
+            ]
+            normalized_toc_chapters = [
+                (title, body) for title, body in normalized_toc_chapters if (body or "").strip()
+            ]
+            full = "\n\n".join(
+                f"# {title}\n\n{body}".strip()
+                for title, body in normalized_toc_chapters
             ).strip()
+            full = re.sub(r"\n{3,}", "\n\n", full)
         else:
             full = join_processed_pages(processed)
-        full = collapse_repeated_paragraphs(merge_wrapped_lines(full))
+            full = collapse_repeated_paragraphs(merge_wrapped_lines(full))
         notes_md = notes_block(all_notes)
         book_md = render_note_refs_as_text(full)
         if notes_md:
@@ -2443,9 +2467,11 @@ def run_job(job_id):
 
         # ---- 5. 切章 + 打包 EPUB ----
         log(job_id, "切分章节并生成 EPUB")
+        prebuilt_for_epub = normalized_toc_chapters if (normalized_toc_chapters and not cfg.get("proofread")) else None
         epub, chapters = build_epub_from_source(full, all_notes, book_dir, slug,
                                                 job["title"], job.get("author", ""),
-                                                cfg, images_dir=images_dir)
+                                                cfg, images_dir=images_dir,
+                                                prebuilt_chapters=prebuilt_for_epub)
         md_out = book_dir / f"{slug}.md"
         md_src = book_dir / ("book.proofread.md" if (book_dir / "book.proofread.md").exists()
                              else "book.md")
